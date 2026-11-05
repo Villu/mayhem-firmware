@@ -175,8 +175,14 @@ class LoRaProcessor : public BasebandProcessor {
     // upper half of the same scratch buffer - the /8 stage only ever fills 256 of the
     // 1024 slots.
     dsp::decimate::FIRC16xR16x16Decim2 decim2_{};
-    const buffer_c16_t decim_buffer2{decim_buf.data() + 512, 512};
+    const buffer_c16_t decim_buffer2{decim_buf.data() + 512, 256};
+    // BW62.5 (NARROW_FAST/SLOW) adds a third /2: 125 -> 62.5 kHz, 64 samples per buffer,
+    // written to the last quarter of the scratch buffer. Same taps as the second stage:
+    // each stage passes +/-0.25 of its own input rate.
+    dsp::decimate::FIRC16xR16x16Decim2 decim2b_{};
+    const buffer_c16_t decim_buffer3{decim_buf.data() + 768, 256};
     bool bw125_{false};               // second decimation stage in use
+    bool bw62_{false};                // second and third decimation stages in use
     uint32_t sf11_out_per_buf_{256};  // decimated samples one baseband buffer yields
 
     // Max supported samples/symbol (sps) at 1 MHz.  256 = SHORT_TURBO SF7/BW500 (OS=2).

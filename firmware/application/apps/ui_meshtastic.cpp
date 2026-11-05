@@ -4832,6 +4832,13 @@ MeshRadioPageView::MeshRadioPageView(NavigationView& nav, MeshSettings& cfg, Mes
     field_region_.set_by_value(cfg_.region_idx);
     field_region_.on_change = [this](size_t, OptionsField::value_t v) {
         cfg_.region_idx = static_cast<uint8_t>(v);
+        // EU 868 <-> EU 868 Narrow carry their own presets; let the preset field's handler
+        // restart the radio once instead of doing it twice.
+        const uint8_t p = meshtastic::preset_for_region(cfg_.region_idx, cfg_.preset_idx);
+        if (p != cfg_.preset_idx) {
+            field_preset_.set_by_value(p);
+            return;
+        }
         update_whip();
         changed_radio();
     };
@@ -4852,6 +4859,11 @@ MeshRadioPageView::MeshRadioPageView(NavigationView& nav, MeshSettings& cfg, Mes
     field_preset_.set_by_value(cfg_.preset_idx);
     field_preset_.on_change = [this](size_t, OptionsField::value_t v) {
         cfg_.preset_idx = static_cast<uint8_t>(v);
+        const uint8_t r = meshtastic::region_for_preset(cfg_.region_idx, cfg_.preset_idx);
+        if (r != cfg_.region_idx) {
+            field_region_.set_by_value(r);  // its handler restarts the radio
+            return;
+        }
         update_whip();
         changed_radio();
     };

@@ -28,12 +28,15 @@ static void check(bool ok, const char* what) {
 
 // RadioInterface::applyModemConfig, rewritten from the description rather than
 // from our own code: MHz floats, spacing included, slot from the djb2 name hash.
+// RadioInterface.cpp: slot width = spacing + 2*padding + bw, numFreqSlots = round(span/width),
+// freq = freqStart + bw/2 + padding + slot*width.
 static double meshtastic_freq_mhz(const RegionConfig& r, double bw_khz, uint32_t slot) {
     const double start = r.freq_start_hz / 1e6, end = r.freq_end_hz / 1e6;
-    const double bw_mhz = bw_khz / 1000.0;
-    double n = std::floor((end - start) / bw_mhz);
+    const double bw_mhz = bw_khz / 1000.0, pad = r.padding_hz / 1e6;
+    const double width = bw_mhz + 2.0 * pad;
+    double n = std::round((end - start) / width);
     if (n < 1) n = 1;
-    return start + bw_mhz / 2.0 + (slot % (uint32_t)n) * bw_mhz;
+    return start + bw_mhz / 2.0 + pad + (slot % (uint32_t)n) * width;
 }
 
 int main() {
@@ -47,7 +50,23 @@ int main() {
         {1, PRESET_LONG_FAST,     869525000, "EU868 LongFast (well-known)"},
         {2, PRESET_LONG_FAST,     433875000, "EU433 LongFast (well-known)"},
         {3, PRESET_LONG_FAST,     919875000, "ANZ LongFast (well-known)"},
+        // Norway since 2026-10-01 (wiki.868.no): EU_N_868, NarrowFast, slot 1.
+        {REGION_EU_N_868, PRESET_NARROW_FAST, 869441650, "EU_N_868 NarrowFast slot 1 (Norway)"},
+        {REGION_EU_N_868, PRESET_NARROW_SLOW, 869441650, "EU_N_868 NarrowSlow slot 1 (stock default)"},
     };
+    // EU_N_868's other two slots, from the comment above RDEF(EU_N_868) in RadioInterface.cpp.
+    check(channel_frequency(REGION_EU_N_868, PRESET_NARROW_FAST, 2) == 869524950, "EU_N_868 slot 2 = 869.52495 MHz");
+    check(channel_frequency(REGION_EU_N_868, PRESET_NARROW_FAST, 3) == 869608250, "EU_N_868 slot 3 = 869.60825 MHz");
+    check(num_channels(REGION_EU_N_868, PRESET_NARROW_FAST) == 3, "EU_N_868 has 3 slots");
+    // Wire enums (config.proto) and the EU_868 <-> EU_N_868 swap.
+    check(meshtastic_modem_preset(PRESET_NARROW_FAST) == 12 && meshtastic_modem_preset(PRESET_NARROW_SLOW) == 13,
+          "NARROW presets carry wire enums 12/13");
+    check(meshtastic_region_code(REGION_EU_N_868) == 32, "EU_N_868 carries wire enum 32");
+    check(region_for_preset(REGION_EU_868, PRESET_NARROW_FAST) == REGION_EU_N_868, "NarrowFast on EU868 moves to EU_N_868");
+    check(region_for_preset(REGION_EU_N_868, PRESET_LONG_FAST) == REGION_EU_868, "LongFast on EU_N_868 moves to EU868");
+    check(preset_for_region(REGION_EU_N_868, PRESET_LONG_FAST) == PRESET_NARROW_SLOW, "entering EU_N_868 lands on NarrowSlow");
+    check(preset_for_region(REGION_EU_N_868, PRESET_NARROW_FAST) == PRESET_NARROW_FAST, "NarrowFast stays on EU_N_868");
+    check(region_for_preset(0, PRESET_NARROW_FAST) == 0, "other regions are left alone");
     for (const auto& a : anchors) {
         const uint64_t got = channel_frequency(a.region, a.preset);
         if (got != a.hz) {
@@ -82,7 +101,10 @@ int main() {
                 // A channel must sit inside its own band, edges included - unless the
                 // preset is simply wider than the band, which no arithmetic can fix and
                 // which the stock firmware handles the same way. Listed below instead.
-                if (mp.bw_hz <= reg.freq_end_hz - reg.freq_start_hz) {
+                // EU_N_868 only takes the narrow presets (the app moves any other preset to
+                // EU 868), so wide presets there are not real combinations.
+                const bool legal = !reg.padding_hz || preset_is_narrow(p);
+                if (legal && mp.bw_hz <= reg.freq_end_hz - reg.freq_start_hz) {
                     snprintf(what, sizeof what, "%s/%s slot %u: %.4f MHz outside %.3f-%.3f",
                              reg.code, mp.name, slot, hz / 1e6,
                              reg.freq_start_hz / 1e6, reg.freq_end_hz / 1e6);
@@ -96,9 +118,14 @@ int main() {
                 snprintf(what, sizeof what, "%s/%s slot override %u", reg.code, mp.name, slot);
                 check(channel_slot(r, p, (uint8_t)slot) == slot - 1, what);
             }
-            // Slot 0 means "derive from the channel name", and the name decides.
-            check(channel_slot(r, p) == (name_hash(PRESET_CHANNEL_NAMES[p]) % n),
-                  "derived slot follows the channel name");
+            // Slot 0 means "derive from the channel name", and the name decides -
+            // unless the region fixes its default slot (EU_N_868: slot 1).
+            if (reg.override_slot)
+                check(channel_slot(r, p) == (uint32_t)(reg.override_slot - 1) % n,
+                      "derived slot follows the region's fixed slot");
+            else
+                check(channel_slot(r, p) == (name_hash(PRESET_CHANNEL_NAMES[p]) % n),
+                      "derived slot follows the channel name");
         }
     }
 
@@ -114,6 +141,7 @@ int main() {
     const HashCase hashes[] = {
         {"LongFast",   0x08, "LongFast (seen on air, incl. under LONG_MODERATE)"},
         {"ShortTurbo", 0x0E, "ShortTurbo (seen on air)"},
+        {"NarrowFast", 0x15, "NarrowFast (xor of name and default key)"},
     };
     for (const auto& h : hashes) {
         const uint8_t got = channel_hash(h.name, DEFAULT_PSK, sizeof(DEFAULT_PSK));
