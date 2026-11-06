@@ -125,6 +125,16 @@ class MeshRouter {
         return d;
     }
 
+    // A repeat of something we already acknowledged: the ACK went missing, send it again.
+    bool take_reack(uint32_t& dest, uint32_t& request_id, uint8_t& channel) {
+        if (!reack_dest_) return false;
+        dest = reack_dest_;
+        request_id = reack_id_;
+        channel = reack_ch_;
+        reack_dest_ = 0;
+        return true;
+    }
+
     size_t build_nodeinfo_tx(uint8_t* out_buf, size_t max_len, const char* long_name, const char* short_name, bool want_response = false, uint32_t dest = BROADCAST_ADDR);
 
     // Our direct neighbours and what we hear each of them at (portnum 71). A neighbour
@@ -249,6 +259,9 @@ class MeshRouter {
     // timer, where there is stack to spare for building the packet.
     uint32_t key_req_dest_{0};
     uint32_t key_req_tick_{0};       // when we last asked, so we ask at most now and then
+    uint32_t reack_dest_{0};         // see take_reack()
+    uint32_t reack_id_{0};
+    uint8_t reack_ch_{0};
     uint32_t last_uptime_ticks_{0};  // the clock the decrypt path has no argument for
     // End-to-end encrypt an already-built Data protobuf when the destination's public
     // key is known. Returns the packet length, or 0 when PKC does not apply and the

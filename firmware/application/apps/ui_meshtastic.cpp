@@ -5828,8 +5828,8 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     // are still settling from run_image - can wedge the M0 on an app restart.
     // Seed the timer so the first NODEINFO fires ~5 s in via on_timer instead.
     nodeinfo_timer_ = nodeinfo_period() - 300;
-    // First telemetry ~8 s in - after the nodeinfo, staggered so the two
-    // self-TXs don't land back-to-back. Seed relative to the configured period.
+    // First telemetry ~8 s in - after the nodeinfo; own_bcast_due() then holds it until
+    // OWN_BCAST_GAP has passed, so it actually leaves ~20 s in. Seed relative to the period.
     const uint32_t telp0 = cfg_.telemetry.tel_min * 3600u;
     telemetry_timer_ = (telp0 > 480) ? telp0 - 480 : 0;
 }
@@ -5906,7 +5906,33 @@ void MeshtasticView::apply_settings() {
         apply_radio_ = false;
         start_rx();
     }
+    note_air_change();
     persist();  // survive a later crash or power-off
+}
+
+// One timer tick of a periodic broadcast. Counts up to the period and holds there until the
+// gap since our previous own broadcast has passed, then fires: a broadcast that falls due
+// while another has just gone out is postponed, not skipped.
+bool MeshtasticView::own_bcast_due(uint32_t& timer, uint32_t period) {
+    if (timer < period) ++timer;
+    if (timer < period) return false;
+    if (last_own_bcast_ && uptime_ticks_ - last_own_bcast_ < OWN_BCAST_GAP) return false;
+    timer = 0;
+    last_own_bcast_ = uptime_ticks_ ? uptime_ticks_ : 1;
+    return true;
+}
+
+void MeshtasticView::note_air_change() {
+    const uint32_t sig = channel_hash_ ^ (static_cast<uint32_t>(cfg_.preset_idx) << 8) ^
+                         (static_cast<uint32_t>(cfg_.region_idx) << 16) ^
+                         (static_cast<uint32_t>(cfg_.freq_slot) << 24) ^ cfg_.freq_override_hz;
+    if (air_sig_set_ && sig != air_sig_) {
+        // ~3 s, like an identity change - unless one is already due sooner.
+        const uint32_t soon = nodeinfo_period() - 180;
+        if (nodeinfo_timer_ < soon) nodeinfo_timer_ = soon;
+    }
+    air_sig_ = sig;
+    air_sig_set_ = true;
 }
 
 void MeshtasticView::pick_position_on_map() {
@@ -6390,16 +6416,12 @@ void MeshtasticView::on_timer() {
     const bool role_announces = (cfg_.node_role != 8) && !cfg_.listen_only;
     const bool role_reports = (cfg_.node_role != 8 && cfg_.node_role != 4) &&
                               !cfg_.listen_only;
-    if (role_announces && cfg_.nodeinfo_min && ++nodeinfo_timer_ >= nodeinfo_period()) {
-        nodeinfo_timer_ = 0;
+    if (role_announces && cfg_.nodeinfo_min && own_bcast_due(nodeinfo_timer_, nodeinfo_period()))
         broadcast_nodeinfo();
-    }
 
     // Neighbour list: sparse on purpose, six hours by default.
-    if (role_reports && cfg_.nbr_min && ++nbr_timer_ >= cfg_.nbr_min * 3600u) {
-        nbr_timer_ = 0;
+    if (role_reports && cfg_.nbr_min && own_bcast_due(nbr_timer_, cfg_.nbr_min * 3600u))
         broadcast_neighborinfo();
-    }
 
     // Periodic identity randomisation (min -> ~60 Hz ticks); 0 = off. Rolls the node
     // id / name / hw-model so we masquerade as a fresh node, then re-announces.
@@ -6410,8 +6432,7 @@ void MeshtasticView::on_timer() {
 
     // POSITION broadcast: user-set period (minutes -> ~60 Hz ticks); 0 = never.
     const uint32_t pos_period = cfg_.telemetry.pos_min * 3600u;
-    if (role_reports && pos_period && ++position_timer_ >= pos_period) {
-        position_timer_ = 0;
+    if (role_reports && pos_period && own_bcast_due(position_timer_, pos_period)) {
         if (cfg_.gps_enabled && gps_position_.valid) {
             broadcast_position();
         } else if (!cfg_.gps_enabled && (cfg_.fixed_lat != 0.0f || cfg_.fixed_lon != 0.0f)) {
@@ -6435,10 +6456,8 @@ void MeshtasticView::on_timer() {
     // telemetry_timer_ so the first one goes out ~8 s after start.
     // TELEMETRY (device/env) broadcast: user-set period; 0 = never.
     const uint32_t tel_period = cfg_.telemetry.tel_min * 3600u;
-    if (role_reports && tel_period && ++telemetry_timer_ >= tel_period) {
-        telemetry_timer_ = 0;
+    if (role_reports && tel_period && own_bcast_due(telemetry_timer_, tel_period))
         broadcast_telemetry();
-    }
 
     // Store and Forward: drain one queued replay line whenever the single TX slot is
     // free, so a burst of history doesn't get dropped by queue_tx's single-slot guard.
@@ -6652,6 +6671,15 @@ void MeshtasticView::on_timer() {
         keyreq_dest_ = 0;
         if (len > 0 && queue_tx(buf, len))
             chat_view_.write_console("* key requested\n");
+    }
+    if (!ack_dest_ && cfg_.send_read_receipts) {
+        uint32_t d = 0, id = 0;
+        uint8_t ch = 0;
+        if (router_.take_reack(d, id, ch)) {
+            ack_dest_ = d;
+            ack_request_id_ = id;
+            ack_channel_ = ch;
+        }
     }
     if (ack_dest_ && !tx_pending_) {
         uint8_t* const buf = pkt_scratch;
@@ -7136,6 +7164,7 @@ void MeshtasticView::apply_channels() {
                                                  sizeof(DEFAULT_PSK));
     }
     router_.set_channel(0, channel_hash_, DEFAULT_PSK, sizeof(DEFAULT_PSK), true);
+    note_air_change();
     // Slots 1..MeshSettings::NUM_CUSTOM = custom channels (name + passphrase/key).
     for (int i = 0; i < MeshSettings::NUM_CUSTOM; i++) {
         const bool on = cfg_.ch_enabled[i] && !cfg_.ch_name[i].empty();
