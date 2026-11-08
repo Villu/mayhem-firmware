@@ -905,7 +905,22 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
         }
 
         // TX gateware consumes complex samples at the rate presented on CLK1.
-        clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
+        if (_datapath_pll_a) {
+            /* As the reference (clock_gen.c sample_rate_set, PRALINE): CLK1 gets exactly
+             * CLK0's settings, 2x the AFE rate through the /2 output divider, so the two
+             * dividers restart in step at the PLL A reset below. FPGA_CLK is then delayed
+             * against AFE_CLK by the reference's offset, (p1 >> 4) - 6 for p1 < 2100, in
+             * register 166 (CLK1 initial phase offset), which also takes effect at that reset. */
+            const uint32_t ms_rate = afe_rate * 2;
+            const uint32_t a = si5351_vco_afe_f / ms_rate;
+            const uint32_t rem = si5351_vco_afe_f - a * ms_rate;
+            const uint32_t p1 = 128 * a + static_cast<uint32_t>((128ULL * rem) / ms_rate) - 512;
+            const uint8_t phase_offset = (p1 < 2100) ? static_cast<uint8_t>((p1 >> 4) - 6) : 0;
+            clock_generator.set_ms_frequency(1, ms_rate, si5351_vco_afe_f, 1);
+            clock_generator.write_register(166, phase_offset);
+        } else {
+            clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
+        }
 
         uint8_t tx_interp = 0;
         uint32_t tx_rate = frequency;
@@ -921,6 +936,9 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
     else {
         // RX path keeps CLK1 at 2x AFE for receive timing / SGPIO alignment.
         clock_generator.set_ms_frequency(1, afe_rate * 2, si5351_vco_afe_f, 0);
+        if (_datapath_pll_a) {
+            clock_generator.write_register(166, 0);  // no CLK1 phase offset in RX (as before)
+        }
 
         // === Stop FPGA processing and flush filters ===
         fpga_debug_register_write(1, 0x00);  // Disable FPGA filters (resets CIC accumulators)
