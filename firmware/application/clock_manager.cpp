@@ -826,6 +826,14 @@ void ClockManager::disable_if_clocks() {
 #endif
 }
 
+/* TEST (phase sweep): CLK1 initial phase offset for PRALINE TX, register 166, in quarter
+ * VCO periods (0.3125 ns at 800 MHz; one 40 MHz period = 80). Set over USB with
+ * write_memory (address from the map file); read back the counter to see it applied. */
+extern "C" {
+__attribute__((used)) volatile uint32_t g_tx_clk1_phase = 42;
+__attribute__((used)) volatile uint32_t g_tx_clk1_phase_applied = 0;
+}
+
 void ClockManager::set_sampling_frequency(const uint32_t frequency) {
 #ifdef PRALINE
     /*
@@ -921,7 +929,9 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
              * dividers that make them. Same CLK1 delay in ns as the reference. */
             clock_generator.set_ms_frequency(0, afe_rate, si5351_vco_afe_f, 0);
             clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
-            clock_generator.write_register(166, phase_offset);
+            (void)phase_offset;
+            clock_generator.write_register(166, static_cast<uint8_t>(g_tx_clk1_phase & 0x7f));
+            g_tx_clk1_phase_applied++;
         } else {
             clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
         }
