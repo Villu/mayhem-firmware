@@ -118,13 +118,16 @@ void TransmitterModel::enable() {
     }
 
     enabled_ = true;
-    radio::set_direction(rf::Direction::Transmit);
+    // As the reference firmware's radio_update() does: everything is configured for TX
+    // first, and the transceiver, RF path and codec switch to TX last.
+    radio::prepare_direction(rf::Direction::Transmit);
     update_tuning_frequency();
     update_antenna_bias();
     update_rf_amp();
     update_baseband_bandwidth();
     update_sampling_rate();
     update_tx_gain();
+    radio::apply_direction();
 
     signal_token_tick_second = rtc_time::signal_tick_second += [this]() {
         this->on_tick_second();

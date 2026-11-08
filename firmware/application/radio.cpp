@@ -205,8 +205,9 @@ void init() {
 #endif
 }
 
-void set_direction(const rf::Direction new_direction) {
-    /* TODO: Refactor all the various "Direction" enumerations into one. */
+/* Direction state only: the tuning tables, clock paths, FPGA mode and Q inversion that
+ * depend on it. apply_direction() then switches the transceiver, RF path and codec. */
+void prepare_direction(const rf::Direction new_direction) {
     /* TODO: Only make changes if direction changes, but beware of clock enabling. */
 
     // That below code line , was used to prevent RX interf ghosting when switching back to RX from any TX mode, but in recent code. it seems not necessary.
@@ -273,7 +274,9 @@ void set_direction(const rf::Direction new_direction) {
 #else
     baseband_cpld.set_invert(mixer_invert ^ baseband_invert);
 #endif
+}
 
+void apply_direction() {
     second_if->set_mode((direction == rf::Direction::Transmit) ? max283x::Mode::Transmit : max283x::Mode::Receive);
     rf_path.set_direction(direction);
 
@@ -283,6 +286,11 @@ void set_direction(const rf::Direction new_direction) {
         led_rx.setActive();
     else
         led_tx.setActive();
+}
+
+void set_direction(const rf::Direction new_direction) {
+    prepare_direction(new_direction);
+    apply_direction();
 }
 
 bool set_tuning_frequency(const rf::Frequency frequency) {

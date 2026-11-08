@@ -45,6 +45,8 @@ struct Configuration {
 void init();
 
 void set_direction(const rf::Direction new_direction);
+void prepare_direction(const rf::Direction new_direction);
+void apply_direction();
 bool set_tuning_frequency(const rf::Frequency frequency);
 void set_rf_amp(const bool rf_amp);
 void set_lna_gain(const int_fast8_t db);
