@@ -916,7 +916,11 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
             const uint32_t rem = si5351_vco_afe_f - a * ms_rate;
             const uint32_t p1 = 128 * a + static_cast<uint32_t>((128ULL * rem) / ms_rate) - 512;
             const uint8_t phase_offset = (p1 < 2100) ? static_cast<uint8_t>((p1 >> 4) - 6) : 0;
-            clock_generator.set_ms_frequency(1, ms_rate, si5351_vco_afe_f, 1);
+            /* TEST: no output dividers in TX. CLK0 and CLK1 both straight from their
+             * multisynths at the AFE rate, so the PLL A reset restarts exactly the two
+             * dividers that make them. Same CLK1 delay in ns as the reference. */
+            clock_generator.set_ms_frequency(0, afe_rate, si5351_vco_afe_f, 0);
+            clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
             clock_generator.write_register(166, phase_offset);
         } else {
             clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
