@@ -30,6 +30,7 @@
 #include "apps/mesh/mesh_nodedb.hpp"
 #include "apps/mesh/mesh_router.hpp"
 #include "apps/mesh/mesh_pki.hpp"
+#include "apps/mesh/meshcore.hpp"
 
 #include <string>
 #include <vector>
@@ -428,6 +429,20 @@ constexpr uint8_t MESH_TX_GAIN_MAX = 31;
 constexpr uint8_t MESH_TX_GAIN_MAX = 47;
 #endif
 
+// ---- MeshCore (a second, separate network) --------------------------------
+// MeshCore is not Meshtastic: other frequency, sync word, packet format and keys. Its
+// settings live here, apart from everything above and below, are stored under "mc_"
+// keys, and are edited on their own Setup page. With it on, the receiver listens to
+// both networks at once (a second demodulator on the same capture); a transmission
+// retunes to whichever network the packet belongs to.
+struct MeshCoreSettings {
+    bool enabled{false};
+    uint8_t preset{0};       // meshcore::PRESETS
+    uint32_t freq_hz{0};     // 0 = the preset's frequency
+    std::string name{};      // sender name in MeshCore group messages; empty = node name
+    bool open{false};        // the chat shows the MeshCore public channel
+};
+
 // ---- Everything this app remembers -----------------------------------------
 // One structure, for the same reason ChatDisplay above is one: the settings screens
 // used to take their share of it as separate reference parameters, and the last of
@@ -565,6 +580,8 @@ struct MeshSettings {
     std::string ch_key[NUM_CUSTOM]{};
     bool ch_enabled[NUM_CUSTOM]{};
     uint8_t active_channel{0};  // 0 = primary
+
+    MeshCoreSettings mc{};  // the other network - see MeshCoreSettings
 };
 
 // ---- What a settings page can ask the app to do ----------------------------
@@ -1017,6 +1034,18 @@ class MeshtasticChatView : public View {
     // Owner reports the active channel index. Each channel keeps its own conversation,
     // so switching channel switches the history shown (and the file it is saved to).
     void set_channel_index(uint8_t idx);
+    // The MeshCore public channel is a conversation of its own, under this index. It is
+    // never a Meshtastic channel number (those are 0..10).
+    static constexpr uint8_t MC_CHANNEL = 0x40;
+    bool on_meshcore() const { return channel_idx_ == MC_CHANNEL && dest_id_ == meshtastic::BROADCAST_ADDR; }
+    // A MeshCore group text arrived (decrypted). sig identifies the packet's content.
+    void on_meshcore_text(const std::string& sender, const std::string& text, int8_t rssi,
+                          uint8_t hops, bool damaged);
+    // Owner builds and queues a MeshCore group text; returns its content signature (the
+    // tag its line carries until a repeater is heard sending it on), 0 = not sent.
+    void set_on_mc_tx_request(std::function<uint32_t(const std::string&)> cb) {
+        on_mc_tx_request_ = std::move(cb);
+    }
     // Update the "Ch" button caption to the active channel name.
     void set_channel_label(const std::string& s) { button_chan_.set_text(s); }
     // Apply the Setup -> Chat options (timestamps, name style, signal, status lines).
@@ -1084,6 +1113,9 @@ class MeshtasticChatView : public View {
     void apply_dest_label();
 
     std::function<void(const uint8_t*, size_t)> on_tx_request_{};
+    std::function<uint32_t(const std::string&)> on_mc_tx_request_{};
+    // Our own text going out on the open conversation, whichever network it is.
+    void send_text(const std::string& text, uint32_t dest);
     std::function<void(uint8_t, uint8_t, uint8_t)> on_gain_{};
     bool loading_gain_{false};  // set_gains must not write the settings straight back
     std::function<void()> on_channels_{};
@@ -1818,6 +1850,35 @@ class MeshChatPageView : public MeshSettingsPage {
     Checkbox check_glyphs_{{16 * 8, S1}, 9, "SD glyphs", true};
 };
 
+// MeshCore: the second network. Its own page, so nothing here can be mistaken for a
+// Meshtastic setting.
+class MeshCorePageView : public MeshSettingsPage {
+   public:
+    MeshCorePageView(NavigationView& nav, MeshSettings& cfg, MeshSettingsHooks& hooks);
+    void focus() override { check_enabled_.focus(); }
+    std::string title() const override { return "MeshCore"; }
+
+   private:
+    Labels labels_{
+        {{0, S1}, "Preset:", Theme::getInstance()->fg_light->foreground},
+        {{0, S2}, "Freq:", Theme::getInstance()->fg_light->foreground},
+        {{0, S3}, "Radio:", Theme::getInstance()->fg_light->foreground},
+        {{0, S4}, "Name:", Theme::getInstance()->fg_light->foreground},
+        {{0, S5}, "Channel: Public", Theme::getInstance()->fg_light->foreground}};
+    Checkbox check_enabled_{{0, S0}, 4, "MeshCore network on", true};
+    OptionsField field_preset_{{8 * 8, S1}, 14, {}};
+    Button button_freq_{{6 * 8, S2, 15 * 8, 16}, ""};
+    Text text_radio_{{7 * 8, S3, 23 * 8, 16}, ""};
+    Button button_name_{{6 * 8, S4, 24 * 8, 16}, ""};
+    // Whether it can be heard alongside Meshtastic right now, and the disclaimer.
+    Text text_note0_{{0, S6, screen_width, 16}, ""};
+    Text text_note1_{{0, S6 + 16, screen_width, 16}, ""};
+    Labels disclaimer_{
+        {{0, S7 + 40}, "MeshCore is a separate network.", Theme::getInstance()->fg_dark->foreground},
+        {{0, S7 + 56}, "Not affiliated with MeshCore.", Theme::getInstance()->fg_dark->foreground}};
+    void refresh();
+};
+
 // ---- Tab: Setup (index 3) --------------------------------------------------
 // Only a menu; each entry pushes the page above. The tab itself is alive for the whole
 // session, and the device has ~27 KB of core memory for everything, so the settings
@@ -1834,12 +1895,16 @@ class MeshtasticSetupMenuView : public View {
 
    private:
     std::function<void(uint8_t)> on_open_{};
-    static constexpr int BH = 30;
+    // Rows 32 apart: six entries and the disclaimer have to share the tab. Radio and
+    // Privacy still cover the spots they always did (taps at y 121 and 157 on screen).
+    static constexpr int BH = 28;
     Button button_profile_{{0, 30, screen_width, BH}, "Profile"};
-    Button button_radio_{{0, 66, screen_width, BH}, "Radio"};
-    Button button_privacy_{{0, 102, screen_width, BH}, "Privacy"};
-    Button button_system_{{0, 138, screen_width, BH}, "System"};
-    Button button_chat_{{0, 174, screen_width, BH}, "Chat"};
+    Button button_radio_{{0, 62, screen_width, BH}, "Radio"};
+    Button button_privacy_{{0, 94, screen_width, BH}, "Privacy"};
+    Button button_system_{{0, 126, screen_width, BH}, "System"};
+    Button button_chat_{{0, 158, screen_width, BH}, "Chat"};
+    // The other network, set apart by its name: nothing on this page is Meshtastic.
+    Button button_meshcore_{{0, 190, screen_width, BH}, "MeshCore (other network)"};
 
     // Said once, here, and nowhere else in the app: this speaks the protocol, it is not
     // the project. The name belongs to them and the app must not imply otherwise.
@@ -1847,9 +1912,9 @@ class MeshtasticSetupMenuView : public View {
     // Sat at 250/266/282 and only the first line was on screen - the two that actually
     // disclaim anything fell off the bottom. A disclaimer nobody can read is not one.
     Labels disclaimer_{
-        {{0, 214}, "Uses the Meshtastic protocol.", Theme::getInstance()->fg_dark->foreground},
-        {{0, 230}, "Not affiliated with Meshtastic", Theme::getInstance()->fg_dark->foreground},
-        {{0, 246}, "LLC, and not endorsed by them.", Theme::getInstance()->fg_dark->foreground}};
+        {{0, 226}, "Uses the Meshtastic protocol.", Theme::getInstance()->fg_dark->foreground},
+        {{0, 242}, "Not affiliated with Meshtastic", Theme::getInstance()->fg_dark->foreground},
+        {{0, 258}, "LLC, and not endorsed by them.", Theme::getInstance()->fg_dark->foreground}};
 };
 
 // ---- Telemetry pages -------------------------------------------------------
@@ -2026,6 +2091,11 @@ class MeshtasticChannelsView : public View {
     // active channel: with a private thread up, the marker used to sit on the public
     // channel and the QR button offered that channel instead of the thread.
     MeshtasticChannelsView(NavigationView& nav, uint8_t preset_idx, uint8_t region_idx, uint8_t freq_slot, uint8_t cr, std::string* names, std::string* keys, bool* enabled, uint8_t* active, std::string* primary_name, meshtastic::NodeDB& node_db, uint32_t open_dm, std::function<void()> on_change, std::function<void(uint32_t)> on_dm, std::function<std::string()> make_key);
+    // MeshCore's public channel, listed after the Meshtastic ones and marked as the other
+    // network. Shown only while MeshCore is on; on_open switches the chat to it.
+    // on_mc(true) = the user picked it; on_mc(false) = a Meshtastic row was picked
+    // while it was open.
+    void set_meshcore(bool shown, bool is_open, std::function<void(bool)> on_mc);
     void focus() override;
     void paint(Painter& painter) override;
     bool on_encoder(const EncoderEvent delta) override;
@@ -2077,7 +2147,8 @@ class MeshtasticChannelsView : public View {
         enum Kind : uint8_t { Primary,
                               Channel,
                               Dm,
-                              Empty } kind{Primary};
+                              Empty,
+                              MeshCore } kind{Primary};
         int slot{0};       // custom-channel index for Channel and Empty
         uint32_t node{0};  // node id for Dm
     };
@@ -2086,7 +2157,11 @@ class MeshtasticChannelsView : public View {
     size_t row_of_open() const;
     size_t dm_count() const;
     uint32_t dm_at(size_t n) const;
-    size_t row_count() const { return NUM_CUSTOM + 1 + dm_count(); }
+    size_t row_count() const { return NUM_CUSTOM + 1 + dm_count() + (mc_shown_ ? 1 : 0); }
+    bool mc_shown_{false};
+    bool mc_open_{false};
+    std::function<void(bool)> on_mc_{};
+    void leave_meshcore();  // a Meshtastic row was chosen
 
     std::string* primary_name_{nullptr};
     static constexpr int NUM_CUSTOM = MeshSettings::NUM_CUSTOM;
@@ -2163,7 +2238,7 @@ class MeshtasticView : public View {
     // from_user = composed by the user (chat): such a packet is never dropped to make
     // room for a relay.
     // Returns false when the packet could not be accepted (queue full, relay).
-    bool queue_tx(const uint8_t* data, size_t len, bool from_user = false);
+    bool queue_tx(const uint8_t* data, size_t len, bool from_user = false, uint8_t net = 0);
     void broadcast_nodeinfo();
     void broadcast_position();
     // Say in the chat that our coordinates went on the air, and which kind they were.
@@ -2175,6 +2250,31 @@ class MeshtasticView : public View {
     // Open the map in point-pick mode and take the confirmed point as our position.
     void pick_position_on_map();
     void update_radio_config();
+
+    // ---- MeshCore ----------------------------------------------------------
+    // The second network. Received frames arrive tagged net = 1 by the baseband and go
+    // here instead of the Meshtastic router; our own messages are queued tagged the same
+    // way, and trigger_tx() retunes for them.
+    static constexpr uint8_t NET_MESHTASTIC = 0;
+    static constexpr uint8_t NET_MESHCORE = 1;
+    uint32_t mt_frequency() const;
+    const meshcore::Preset& mc_preset() const;
+    uint32_t mc_frequency() const;
+    // Whether the baseband can run the MeshCore receiver beside the Meshtastic one with
+    // the current settings (both at SF <= 8 and close enough in frequency).
+    bool mc_rx_possible() const;
+    const char* mc_rx_problem() const;  // why not, for the chat and the settings page
+    void on_meshcore_packet(const LoRaPacketMessage* msg);
+    uint32_t send_meshcore_text(const std::string& text);
+    meshcore::Channel mc_public_{};
+    // Recently heard packets, by content signature: the same message arrives once from
+    // its sender and again from every repeater that floods it on.
+    static constexpr size_t MC_SEEN = 16;
+    uint32_t mc_seen_[MC_SEEN]{};
+    uint8_t mc_seen_next_{0};
+    uint32_t mc_rx_count_{0};
+    uint32_t mc_bad_count_{0};
+    uint8_t tx_net_{NET_MESHTASTIC};  // which network the packet in tx_buf_ belongs to
 
     NavigationView& nav_;
 
@@ -2235,6 +2335,9 @@ class MeshtasticView : public View {
     // the demodulator state.
     uint16_t reconfig_delay_{0};
     void resend_lora_config();
+    // The receiver's full configuration: Meshtastic, plus MeshCore when it is on and
+    // the two can be heard together.
+    LoRaConfigureMessage rx_lora_config() const;
     // One direct message is repeated at a time - the most recent one still waiting for
     // a receipt. Meshtastic repeats the SAME packet id, so the far side recognises the
     // repeat as a duplicate and its acknowledgement still matches our message.

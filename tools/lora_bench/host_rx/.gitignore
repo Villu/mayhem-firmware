@@ -1,0 +1,8 @@
+build/
+old/
+host_rx
+host_rx_dbg
+host_rx_dbg2
+host_rx_mcmain
+dtest
+shim/message_lora.inc

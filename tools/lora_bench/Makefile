@@ -23,12 +23,13 @@ SIMPLE = test_lora_framing test_lora_ref test_lora_rssi test_synth_free
 # These pull in real firmware translation units.
 REGIONS_SRC = $(APP)/mesh_crypto.cpp
 CRYPTO_SRC  = $(APP)/mesh_crypto.cpp
+MESHCORE_SRC = $(APP)/meshcore.cpp $(APP)/mesh_pki.cpp
 ROUTER_SRC  = $(APP)/mesh_router.cpp $(APP)/mesh_protocol.cpp \
               $(APP)/mesh_crypto.cpp $(APP)/mesh_nodedb.cpp $(APP)/mesh_pki.cpp
 
 TESTS = test_lora_framing test_lora_ref test_lora_rssi \
         test_mesh_regions test_mesh_crypto test_mesh_router \
-        test_mesh_telemetry test_mesh_partial
+        test_mesh_telemetry test_mesh_partial test_meshcore
 
 all: run
 
@@ -57,6 +58,9 @@ test_mesh_telemetry: test_mesh_telemetry.cpp $(ROUTER_SRC)
 
 test_mesh_partial: test_mesh_partial.cpp $(ROUTER_SRC)
 	$(CXX) $(CXXFLAGS) $(INC) -o $@ $^
+
+test_meshcore: test_meshcore.cpp $(MESHCORE_SRC)
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 # Run them all and stop at the first failure, so a red build says which one.
 run: build

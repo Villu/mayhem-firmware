@@ -19,3 +19,4 @@ test_mesh_crypto
 test_mesh_router
 test_mesh_telemetry
 test_mesh_partial
+test_meshcore

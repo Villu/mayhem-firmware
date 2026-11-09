@@ -32,10 +32,46 @@
 // Full RX chain: dechirp+FFT -> deinterleave -> dewhiten -> Hamming decode.
 // Half-duplex only - HackRF cannot RX and TX simultaneously.
 
-class LoRaProcessor : public BasebandProcessor {
+// One LoRa receive chain: decimation, demodulation and frame decode for one channel.
+// The baseband processor below owns one of these for Meshtastic and, when a second
+// network is configured (MeshCore), another on a different frequency fed from the same
+// 2 MS/s stream. Both share the processor's sample ring; see attach().
+class LoRaRxChain {
    public:
-    void execute(const buffer_c8_t& buffer) override;
-    void on_message(const Message* const message) override;
+    // What a candidate frame header has to look like before the chain commits to it.
+    // Meshtastic: the first four bytes are the destination (broadcast or us). MeshCore:
+    // a version-1 header byte and a path that fits the frame.
+    enum class Gate : uint8_t { Meshtastic,
+                                MeshCore };
+
+    void execute(const buffer_c8_t& buffer);
+    void configure(uint8_t sf, uint32_t bw, uint8_t cr, uint32_t node_id);
+    // Where this chain keeps its streaming buffers inside the shared ring (in complex8
+    // units). The defaults are the single-chain layout; a second chain takes the room
+    // the first leaves free at SF <= 8 (see LoRaProcessor::configure).
+    void attach(complex8_t* ring, uint32_t ref_off, uint32_t fft_off, uint32_t win_off, uint32_t win_len) {
+        ring_ = ring;
+        ref_off_ = ref_off;
+        fft_off_ = fft_off;
+        win_off_ = win_off;
+        win_len_ = win_len;
+    }
+    void set_identity(uint8_t net, Gate gate, uint8_t* busy_mask) {
+        net_ = net;
+        gate_ = gate;
+        busy_mask_ = busy_mask ? busy_mask : &own_busy_;
+    }
+    void stop() { rx_active = false; }
+    // How many symbols the SFD search waits after the preamble locked. The lock comes six
+    // symbols in, so this has to cover the rest of the longest preamble expected: 24 is
+    // Meshtastic's 16 with room to spare, MeshCore's 32 at SF <= 8 needs more.
+    void set_preamble(uint8_t symbols) { sfd_wait_syms_ = (symbols + 8u > 24u) ? symbols + 8u : 24u; }
+    bool streaming() const { return sf11_mode_; }
+    uint32_t symbol_samples() const { return sf11_sps_; }
+
+    static constexpr size_t SF11_SPS{2048};  // MAX sps = buffer/layout size (ref/fft/win alloc)
+    static constexpr size_t SF11_WIN{11 * SF11_SPS / 2};
+    static constexpr size_t RING{108 * 256};
 
    private:
     // LoRa parameters (set via LoRaConfigureMessage)
@@ -218,14 +254,13 @@ class LoRaProcessor : public BasebandProcessor {
     // so the ring must hold the whole packet: TELEMETRY ~98 sym, POSITION
     // ~104 sym. 100 dropped both (too tight); 112 OOM'd the M4 heap; 108 fits
     // with a small margin. (Long text / NodeInfo ~110-123 sym still overrun.)
-    static constexpr size_t RING{108 * 256};
+    // (RING itself is declared above, public: the processor allocates it.)
 
     // --- LONG_FAST (SF11/BW250) streaming buffers - UNION with the SF7 ring ------
     // SF7 (store-and-decode) uses ring_; SF11 (streaming) uses sf11_.  They are never
     // active together (SF is fixed per session), so they share the same 54 KiB - RAM
     // stays exactly as before (no OOM).  The float member makes the union 4-aligned,
     // so both views are safe.  See the proc_lora.cpp SF11 section for the algorithm.
-    static constexpr size_t SF11_SPS{2048};  // MAX sps = buffer/layout size (ref/fft/win alloc)
     uint32_t sf11_sps_{2048};                // RUNTIME samples/symbol = 2^SF (<=2048): 128/256/512/1024/2048
     uint32_t sf11_stages_{11};               // log2(sps) FFT butterfly stages (8/9/10/11)
     uint32_t sf11_nsteps_{8};                // demod steps = sps/256 = buffers/symbol (1/2/4/8)
@@ -235,22 +270,28 @@ class LoRaProcessor : public BasebandProcessor {
     // that slip accumulated past a 3-symbol window and tripped sf11_win_stale(), silently
     // killing most packets. 5 symbols buys ~4 symbols of lag. Fits the ring: ref 16K + fft
     // 16K + win 20K = 52 KiB of the 54 KiB.
-    static constexpr size_t SF11_WIN{11 * SF11_SPS / 2};  // 5.5-symbol rolling window (uses the ring's spare 2 KiB -> more FINE staleness margin after the RESOLVE latency)
+    // SF11_WIN (above): 5.5-symbol rolling window (uses the ring's spare 2 KiB -> more FINE
+    // staleness margin after the RESOLVE latency). win_len_ is this chain's actual length.
     // The SF7 ring and the SF11 streaming buffers share this 54 KiB (never active
     // together - SF is fixed per session), so RAM is unchanged (no OOM).  Done via
     // reinterpret views (not a union: std::complex<float>'s non-trivial ctor deletes a
     // union's default ctor).  alignas(8) makes the complex<float> view properly aligned.
     // Layout: [ref11 16 KiB][fft11 16 KiB][win11 12 KiB] within the 54 KiB (spare tail).
-    alignas(8) std::array<complex8_t, RING> ring_{};
-    std::complex<float>* sf11_ref() { return reinterpret_cast<std::complex<float>*>(ring_.data()); }
+    // The ring belongs to the processor; this chain sees it through attach().
+    complex8_t* ring_{nullptr};
+    uint32_t ref_off_{0};
+    uint32_t fft_off_{SF11_SPS * 4};
+    uint32_t win_off_{SF11_SPS * 8};
+    uint32_t win_len_{SF11_WIN};
+    std::complex<float>* sf11_ref() { return reinterpret_cast<std::complex<float>*>(ring_ + ref_off_); }
     // At SF12 a symbol is 4096 samples and the stored reference no longer fits, so it
     // is generated as the dechirp runs and the FFT takes its place at the start of the
     // ring. The window keeps both its offset and its length either way - the reference
     // frees exactly as much as the doubled FFT wants - so none of the wrap arithmetic
     // below changes, which is the only reason this is a small change instead of a big one.
     std::complex<float>* sf11_fft() { return reinterpret_cast<std::complex<float>*>(
-        ring_.data() + (sf11_gen_ref_ ? 0u : SF11_SPS * 4)); }
-    complex8_t* sf11_win() { return ring_.data() + SF11_SPS * 8; }
+        ring_ + (sf11_gen_ref_ ? ref_off_ : fft_off_)); }
+    complex8_t* sf11_win() { return ring_ + win_off_; }
     uint32_t write_idx_{0};     // monotonic write count (for spans)
     uint32_t read_idx_{0};      // next symbol start to process
     bool snapped_{false};       // timing snap done this packet
@@ -448,7 +489,8 @@ class LoRaProcessor : public BasebandProcessor {
     void sf11_recompute_ref(float cfo_ramp);    // rebuild ref11 = exp(-j(base+cfo*n))
     void sf11_dechirp_chunk(uint32_t part, uint32_t parts);
     uint8_t sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32_t off, uint8_t* out, uint8_t out_cap);  // bins->frame bytes (self-contained)
-    bool sf11_try_decode();                                                                                     // decode all (da,off) from bins -> winner
+    bool sf11_try_decode();
+    bool sf11_commit(const int16_t* bins, uint8_t nbins, int da, uint32_t off, int hs);                                                                                     // decode all (da,off) from bins -> winner
     void sf11_reset();
 
     // --- Core DSP ------------------------------------------------------------
@@ -471,12 +513,51 @@ class LoRaProcessor : public BasebandProcessor {
     uint8_t lora_whiten_step();
     void reset_rx();
 
-    void configure(const LoRaConfigureMessage& message);
     void send_packet(const uint8_t* data, size_t len);
     // Tell the application whether a packet is currently being demodulated, so it can
-    // listen before talking (only sent on a change - one message per packet edge).
+    // listen before talking (only sent on a change - one message per packet edge). With
+    // two chains the application hears "busy" while either of them is inside a packet.
     void set_rx_busy(bool busy);
     bool rx_busy_{false};
+    uint8_t own_busy_{0};
+    uint8_t* busy_mask_{&own_busy_};
+
+    uint8_t net_{0};  // LoRaPacketMessage::net of what this chain delivers
+    uint32_t sfd_wait_syms_{24};
+    Gate gate_{Gate::Meshtastic};
+    // Header fields of the last sf11_decode_bins() candidate, for the MeshCore gate.
+    uint8_t cand_cr_{0};
+    bool cand_crc_{false};
+    uint8_t cand_parity_bad_{0xFF};
+    bool header_plausible(const uint8_t* frame, uint8_t len) const;
+};
+
+// The LoRa receive baseband: one chain for the application's main network, and an
+// optional second one (MeshCore) on another frequency in the same 2 MS/s capture. The
+// second chain gets its own copy of the stream shifted by the frequency difference, so
+// the main chain's signal path stays exactly what it is on its own.
+class LoRaProcessor : public BasebandProcessor {
+   public:
+    LoRaProcessor();
+    void execute(const buffer_c8_t& buffer) override;
+    void on_message(const Message* const message) override;
+
+   private:
+    void configure(const LoRaConfigureMessage& message);
+    void shift_for_aux(const buffer_c8_t& buffer);
+
+    static constexpr size_t baseband_fs{2000000};
+    alignas(8) std::array<complex8_t, LoRaRxChain::RING> ring_{};
+    LoRaRxChain main_{};
+    LoRaRxChain aux_{};
+    bool aux_on_{false};
+    uint8_t busy_mask_{0};
+    // Frequency shift for the second chain: a 512-entry cos/sin table (Q14) and a 32-bit
+    // phase accumulator.
+    static constexpr int NCO_BITS{9};
+    std::array<uint32_t, 1u << NCO_BITS> nco_lut_{};  // packed (cos | sin << 16)
+    uint32_t nco_phase_{0};
+    uint32_t nco_step_{0};
 
     /* NB: Threads must be the last members. */
     BasebandThread baseband_thread{baseband_fs, this, baseband::Direction::Receive};
