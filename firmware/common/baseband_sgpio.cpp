@@ -248,9 +248,17 @@ constexpr CONCAT_ORDER data_concat_order(
 
 constexpr CLK_CAPTURE_MODE data_clk_capture_mode(
     const Direction direction) {
+#ifdef PRALINE
+    /* TEST: TX bytes change on the falling edge of the FPGA's byte clock,
+     * half an FPGA cycle later than before, to see if the FPGA's read point is marginal. */
+    return (direction == Direction::Transmit)
+               ? CLK_CAPTURE_MODE::FALLING_CLOCK_EDGE
+               : CLK_CAPTURE_MODE::RISING_CLOCK_EDGE;
+#else
     return (direction == Direction::Transmit)
                ? CLK_CAPTURE_MODE::RISING_CLOCK_EDGE
                : CLK_CAPTURE_MODE::RISING_CLOCK_EDGE;
+#endif
 }
 
 constexpr P_OUT_CFG data_p_out_cfg(
