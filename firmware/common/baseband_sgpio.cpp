@@ -295,10 +295,8 @@ void SGPIO::configure(const Direction direction) {
     LPC_SGPIO->OUT_MUX_CFG[8] = out_mux_cfg(P_OUT_CFG::DOUT_DOUTM1, P_OE_CFG::GPIO_OE);
     LPC_SGPIO->OUT_MUX_CFG[9] = out_mux_cfg(P_OUT_CFG::DOUT_DOUTM1, P_OE_CFG::GPIO_OE);
 
-#ifndef PRALINE
-    // OUT_MUX_CFG[10] NOT configured for PRALINE - breaks PRALINE (HOST_DISABLE signal)
+    // SGPIO10 = DISABLE: high during configuration, cleared by streaming_enable()
     LPC_SGPIO->OUT_MUX_CFG[10] = out_mux_cfg(P_OUT_CFG::GPIO_OUT, P_OE_CFG::GPIO_OE);
-#endif
 
     LPC_SGPIO->OUT_MUX_CFG[11] = out_mux_cfg(P_OUT_CFG::GPIO_OUT, P_OE_CFG::GPIO_OE);
 #ifndef PRALINE
