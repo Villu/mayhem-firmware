@@ -1852,13 +1852,13 @@ bool MeshtasticChatView::on_touch(const TouchEvent event) {
 // channel, a Meshtastic packet everywhere else.
 void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
     const bool unicast = (dest != BROADCAST_ADDR);
-    const bool meshcore = !unicast && channel_idx_ == MC_CHANNEL;
+    const bool meshcore = !unicast && is_mc_channel(channel_idx_);
     uint32_t pid = 0;
     uint8_t* const buf = pkt_scratch;
     size_t len = 0;
     if (meshcore) {
         if (!on_mc_tx_request_) return;
-        pid = on_mc_tx_request_(text);  // built and queued by the owner
+        pid = on_mc_tx_request_(text, channel_idx_);  // built and queued by the owner
         if (!pid) return;
     } else {
         // Ask for an ACK only on a direct (unicast) message - a broadcast
@@ -1976,6 +1976,7 @@ std::u16string MeshtasticChatView::conversation_path(uint32_t peer, uint8_t chan
     // flash for, and the card always has /LOGS.
     std::u16string p = u"/LOGS/mesh_";
     if (peer == BROADCAST_ADDR && channel == MC_CHANNEL) return u"/LOGS/mesh_mc0.txt";
+    if (peer == BROADCAST_ADDR && channel == MC_CHANNEL2) return u"/LOGS/mesh_mc1.txt";
     if (peer != BROADCAST_ADDR) {
         p += u'd';
         const std::string hex = to_string_hex(peer, 8);
@@ -2048,6 +2049,7 @@ void MeshtasticChatView::clear_all_history() {
     for (uint8_t ch = 0; ch <= 10; ch++)
         delete_file(conversation_path(BROADCAST_ADDR, ch));
     delete_file(conversation_path(BROADCAST_ADDR, MC_CHANNEL));
+    delete_file(conversation_path(BROADCAST_ADDR, MC_CHANNEL2));
     for (size_t i = 0; i < node_db_.count(); i++) {
         const NodeEntry* e = node_db_.at(i);
         if (e && e->node_id) delete_file(conversation_path(e->node_id, 0));
@@ -2632,7 +2634,7 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
 
 // A MeshCore group text. Its sender is a name, not a node we know: MeshCore puts
 // "name: " in front of the text itself, and there is no node list for it here.
-void MeshtasticChatView::on_meshcore_text(const std::string& sender, const std::string& text_in,
+void MeshtasticChatView::on_meshcore_text(uint8_t channel, const std::string& sender, const std::string& text_in,
                                           int8_t rssi, uint8_t hops, bool damaged) {
     std::string text = text_in;
     while (!text.empty() && static_cast<uint8_t>(text.back()) < 0x20) text.pop_back();
@@ -2643,13 +2645,13 @@ void MeshtasticChatView::on_meshcore_text(const std::string& sender, const std::
     m.to_id = BROADCAST_ADDR;
     m.rssi = rssi;
     m.hops = hops;
-    m.channel = MC_CHANNEL;
+    m.channel = channel;
     m.sent_tick = now_ticks_;
     if (messages_.size() >= MAX_MESSAGES) messages_.erase(messages_.begin());
     messages_.push_back(m);
     const std::string who = (display_.name_mode == 3) ? std::string() : m.from_name;
     const std::string line = stamp() + (damaged ? "[?] " : "") + who + (who.empty() ? "" : ": ") + text;
-    if (dest_id_ == BROADCAST_ADDR && channel_idx_ == MC_CHANNEL) {
+    if (dest_id_ == BROADCAST_ADDR && channel_idx_ == channel) {
         console_.set_message_index(messages_.size() - 1);
         console_.take_unicode_flag();
         console_.take_bell_flag();
@@ -2659,8 +2661,9 @@ void MeshtasticChatView::on_meshcore_text(const std::string& sender, const std::
             console_.write_tech("* no glyph for some characters\n");
         console_.take_bell_flag();
     } else {
-        save_line_to(conversation_path(BROADCAST_ADDR, MC_CHANNEL), line + "\n");
-        console_.write_tech("* new message in MeshCore Public\n");
+        save_line_to(conversation_path(BROADCAST_ADDR, channel), line + "\n");
+        console_.write_tech("* new message in MeshCore " +
+                            (channel == MC_CHANNEL2 ? mc2_name_ : std::string("Public")) + "\n");
     }
     text_count_.set("m:" + to_string_dec_uint(++total_msgs_));
     if (beep_flag_ && *beep_flag_)
@@ -4248,9 +4251,12 @@ void MeshtasticChannelsView::focus() {
     Widget::focus();
 }
 
-void MeshtasticChannelsView::set_meshcore(bool shown, bool is_open, std::function<void(bool)> on_mc) {
+void MeshtasticChannelsView::set_meshcore(bool shown, uint8_t open_which, const std::string& second_name,
+                                          std::function<void(uint8_t)> on_mc) {
     mc_shown_ = shown;
-    mc_open_ = shown && is_open;
+    mc2_name_ = second_name;
+    mc_which_ = (open_which == 2 && second_name.empty()) ? 1 : open_which;
+    mc_open_ = shown && mc_which_ != 0;
     on_mc_ = std::move(on_mc);
     selected_ = row_of_open();  // the constructor picked a row before it knew about this one
     if (selected_ >= scroll_offset_ + VISIBLE) scroll_offset_ = selected_ - VISIBLE + 1;
@@ -4283,7 +4289,7 @@ size_t MeshtasticChannelsView::row_of_open() const {
         if (open_dm_) {
             if (info.kind == Row::Dm && info.node == open_dm_) return r;
         } else if (mc_open_) {
-            if (info.kind == Row::MeshCore) return r;
+            if (info.kind == Row::MeshCore && info.slot + 1 == mc_which_) return r;
         } else if (info.kind == Row::Primary) {
             if (*active_ == 0) return r;
         } else if (info.kind == Row::Channel) {
@@ -4318,9 +4324,10 @@ MeshtasticChannelsView::Row MeshtasticChannelsView::row_at(size_t row) const {
         }
         seen++;
     }
-    if (mc_shown_) {  // the other network's channel, after everything Meshtastic in use
+    for (size_t m = 0; m < mc_rows(); m++) {  // the other network's channels, after everything Meshtastic in use
         if (seen == row) {
             out.kind = Row::MeshCore;
+            out.slot = static_cast<int>(m);  // 0 Public, 1 the second channel
             return out;
         }
         seen++;
@@ -4363,7 +4370,8 @@ void MeshtasticChannelsView::paint(Painter& painter) {
                     primary_label();
                 break;
             case Row::MeshCore:
-                t = std::string((!open_dm_ && mc_open_) ? "> " : "  ") + "MeshCore: Public";
+                t = std::string((!open_dm_ && mc_open_ && mc_which_ == info.slot + 1) ? "> " : "  ") +
+                    "MeshCore: " + (info.slot ? mc2_name_ : std::string("Public"));
                 break;
             case Row::Channel:
                 t = std::string((!open_dm_ && !mc_open_ &&
@@ -4477,7 +4485,7 @@ void MeshtasticChannelsView::open_row(size_t row) {
             break;
         case Row::MeshCore:
             if (on_dm_) on_dm_(meshtastic::BROADCAST_ADDR);  // out of any private thread
-            if (on_mc_) on_mc_(true);
+            if (on_mc_) on_mc_(static_cast<uint8_t>(info.slot + 1));
             nav_.pop();
             break;
     }
@@ -4488,7 +4496,8 @@ void MeshtasticChannelsView::open_row(size_t row) {
 void MeshtasticChannelsView::leave_meshcore() {
     if (!mc_open_) return;
     mc_open_ = false;
-    if (on_mc_) on_mc_(false);
+    mc_which_ = 0;
+    if (on_mc_) on_mc_(0);
 }
 
 // What the primary channel is actually called, and the hash byte that name produces -
@@ -4696,28 +4705,106 @@ void MeshtasticChannelsView::show_qr() {
 // MeshCore page
 // ============================================================================
 
+namespace {
+
+// The modem MeshCore runs with: one of the presets, or the custom one - kept to what the
+// transmitter makes exactly (its 2.5 MHz rate divides these bandwidths evenly).
+meshcore::Preset mc_modem_of(const MeshSettings& cfg) {
+    if (cfg.mc.preset < meshcore::NUM_PRESETS) return meshcore::PRESETS[cfg.mc.preset];
+    const uint32_t bw = cfg.mc.bw_hz;
+    const bool bw_ok = (bw == 62500 || bw == 125000 || bw == 250000 || bw == 500000);
+    return {"Custom", meshcore::PRESETS[0].freq_hz, bw_ok ? bw : 62500u,
+            static_cast<uint8_t>((cfg.mc.sf >= 7 && cfg.mc.sf <= 12) ? cfg.mc.sf : 8),
+            static_cast<uint8_t>((cfg.mc.cr >= 5 && cfg.mc.cr <= 8) ? cfg.mc.cr : 8)};
+}
+
+uint32_t mc_freq_of(const MeshSettings& cfg) {
+    return cfg.mc.freq_hz ? cfg.mc.freq_hz : mc_modem_of(cfg).freq_hz;
+}
+
+uint32_t mt_freq_of(const MeshSettings& cfg) {
+    return cfg.freq_override_hz ? cfg.freq_override_hz
+                                : static_cast<uint32_t>(channel_frequency(cfg.region_idx, cfg.preset_idx, cfg.freq_slot,
+                                                                          cfg.primary_name.c_str()));
+}
+
+// The baseband's own conditions for a second demodulator (LoRaProcessor::configure):
+// both chains streaming at SF7/8 so they share its sample ring, and the MeshCore channel
+// inside the receiver's band. nullptr = it can listen; otherwise a short reason.
+const char* mc_rx_problem_of(const MeshSettings& cfg) {
+    const auto& mt = meshtastic::MODEM_PRESETS[cfg.preset_idx];
+    const auto p = mc_modem_of(cfg);
+    auto narrow_enough = [](uint8_t sf, uint32_t bw) {
+        return sf >= 7 && sf <= 8 && (bw == 62500 || bw == 125000 || bw == 250000);
+    };
+    if (!narrow_enough(mt.sf, mt.bw_hz)) return "Meshtastic not SF7/8";
+    if (!narrow_enough(p.sf, p.bw_hz)) return "MeshCore not SF7/8 <=250k";
+    const int64_t off = static_cast<int64_t>(mc_freq_of(cfg)) - static_cast<int64_t>(mt_freq_of(cfg));
+    if (off <= -1100000 || off >= 300000) return "too far from Meshtastic";
+    return nullptr;
+}
+
+// The second group channel: a key typed in (hex or base64), or with none a "#name"
+// hashtag channel. False = no channel, or one that cannot be used as entered.
+bool mc_second_channel_of(const MeshSettings& cfg, meshcore::Channel& out) {
+    if (cfg.mc.ch_name.empty()) return false;
+    if (cfg.mc.ch_key.empty()) return meshcore::hashtag_channel(cfg.mc.ch_name.c_str(), out);
+    uint8_t key[32];
+    const size_t n = meshcore::parse_key(cfg.mc.ch_key.c_str(), key);
+    return n && meshcore::make_channel(key, n, out);
+}
+
+}  // namespace
+
 MeshCorePageView::MeshCorePageView(NavigationView& nav, MeshSettings& cfg, MeshSettingsHooks& hooks)
     : MeshSettingsPage(nav, cfg, hooks) {
-    add_children({&labels_, &check_enabled_, &field_preset_, &button_freq_, &text_radio_,
-                  &button_name_, &text_note0_, &text_note1_, &disclaimer_});
+    add_children({&labels_, &check_enabled_, &field_preset_, &button_freq_, &field_sf_, &field_bw_,
+                  &field_cr_, &button_name_, &button_ch_, &button_key_, &text_note0_, &text_note1_,
+                  &disclaimer_});
     check_enabled_.set_value(cfg_.mc.enabled);
     check_enabled_.on_select = [this](Checkbox&, bool v) {
         cfg_.mc.enabled = v;
-        if (!v) cfg_.mc.open = false;
+        if (!v) cfg_.mc.open = 0;
         refresh();
         changed_radio();  // the receiver gains or loses its second demodulator
     };
     {
         OptionsField::options_t opts;
-        opts.reserve(meshcore::NUM_PRESETS);
+        opts.reserve(meshcore::NUM_PRESETS + 1);
         for (uint8_t i = 0; i < meshcore::NUM_PRESETS; i++)
             opts.emplace_back(meshcore::PRESETS[i].name, i);
+        opts.emplace_back("Custom", meshcore::NUM_PRESETS);
         field_preset_.set_options(std::move(opts));
     }
-    if (cfg_.mc.preset >= meshcore::NUM_PRESETS) cfg_.mc.preset = 0;
-    field_preset_.set_by_value(cfg_.mc.preset);
+    if (cfg_.mc.preset > meshcore::NUM_PRESETS) cfg_.mc.preset = 0;
     field_preset_.on_change = [this](size_t, OptionsField::value_t v) {
-        cfg_.mc.preset = static_cast<uint8_t>(v);
+        if (refreshing_) return;
+        if (static_cast<size_t>(v) == meshcore::NUM_PRESETS) {
+            to_custom();
+        } else {
+            cfg_.mc.preset = static_cast<uint8_t>(v);
+        }
+        refresh();
+        changed_radio();
+    };
+    field_sf_.on_change = [this](int32_t v) {
+        if (refreshing_) return;
+        to_custom();
+        cfg_.mc.sf = static_cast<uint8_t>(v);
+        refresh();
+        changed_radio();
+    };
+    field_bw_.on_change = [this](size_t, OptionsField::value_t v) {
+        if (refreshing_) return;
+        to_custom();
+        cfg_.mc.bw_hz = static_cast<uint32_t>(v);
+        refresh();
+        changed_radio();
+    };
+    field_cr_.on_change = [this](int32_t v) {
+        if (refreshing_) return;
+        to_custom();
+        cfg_.mc.cr = static_cast<uint8_t>(v);
         refresh();
         changed_radio();
     };
@@ -4740,34 +4827,74 @@ MeshCorePageView::MeshCorePageView(NavigationView& nav, MeshSettings& cfg, MeshS
                         refresh();
                         changed(); }, false);
     };
+    button_ch_.on_select = [this](Button&) {
+        // "#topic" on its own is a hashtag channel; any other name needs its key below.
+        // Empty removes the channel.
+        entry_ = cfg_.mc.ch_name;
+        mesh_prompt(nav_, entry_, 31, [this](std::string& val) {
+                        cfg_.mc.ch_name = val;
+                        if (val.empty() && cfg_.mc.open == 2) cfg_.mc.open = 1;
+                        refresh();
+                        changed(); }, false);
+    };
+    button_key_.on_select = [this](Button&) {
+        // 32 or 64 hex digits, or base64. Empty = the hashtag key from the name.
+        entry_ = cfg_.mc.ch_key;
+        mesh_prompt(nav_, entry_, 64, [this](std::string& val) {
+                        cfg_.mc.ch_key = val;
+                        refresh();
+                        changed(); }, false);
+    };
     refresh();
 }
 
+void MeshCorePageView::to_custom() {
+    if (cfg_.mc.preset >= meshcore::NUM_PRESETS) return;
+    const auto& p = meshcore::PRESETS[cfg_.mc.preset];
+    cfg_.mc.sf = p.sf;
+    cfg_.mc.bw_hz = p.bw_hz;
+    cfg_.mc.cr = p.cr;
+    if (!cfg_.mc.freq_hz) cfg_.mc.freq_hz = p.freq_hz;  // stay where the preset was
+    cfg_.mc.preset = meshcore::NUM_PRESETS;
+}
+
 void MeshCorePageView::refresh() {
-    const auto& p = meshcore::PRESETS[cfg_.mc.preset < meshcore::NUM_PRESETS ? cfg_.mc.preset : 0];
-    const uint32_t hz = cfg_.mc.freq_hz ? cfg_.mc.freq_hz : p.freq_hz;
+    refreshing_ = true;
+    const auto p = mc_modem_of(cfg_);
+    const uint32_t hz = mc_freq_of(cfg_);
+    field_preset_.set_by_value(cfg_.mc.preset);
     button_freq_.set_text(cfg_.mc.freq_hz ? fmt_freq_mhz(hz) : fmt_freq_mhz(hz) + "*");
-    text_radio_.set("SF" + to_string_dec_uint(p.sf) + " " +
-                    (p.bw_hz == 62500 ? std::string("62.5") : to_string_dec_uint(p.bw_hz / 1000)) +
-                    "kHz CR4/" + to_string_dec_uint(p.cr));
+    field_sf_.set_value(p.sf);
+    field_bw_.set_by_value(p.bw_hz);
+    field_cr_.set_value(p.cr);
+    refreshing_ = false;
     button_name_.set_text(cfg_.mc.name.empty() ? std::string(cfg_.node_long_name) + "*" : cfg_.mc.name);
-    // Can it be heard alongside Meshtastic? The same test the receiver applies.
-    const auto& mt = meshtastic::MODEM_PRESETS[cfg_.preset_idx];
-    const uint32_t mt_hz = cfg_.freq_override_hz ? cfg_.freq_override_hz
-                                                 : static_cast<uint32_t>(channel_frequency(cfg_.region_idx, cfg_.preset_idx, cfg_.freq_slot, cfg_.primary_name.c_str()));
-    const int64_t off = static_cast<int64_t>(hz) - static_cast<int64_t>(mt_hz);
+
+    meshcore::Channel ch2;
+    const bool ch2_ok = mc_second_channel_of(cfg_, ch2);
+    if (cfg_.mc.ch_name.empty()) {
+        button_ch_.set_text("(none)");
+        button_key_.set_text("-");
+    } else {
+        button_ch_.set_text(cfg_.mc.ch_name);
+        if (!cfg_.mc.ch_key.empty())
+            button_key_.set_text(ch2_ok ? cfg_.mc.ch_key.substr(0, 12) + ".. " + to_string_hex(ch2.hash, 2)
+                                        : std::string("not hex/base64!"));
+        else
+            button_key_.set_text(ch2_ok ? "from name, " + to_string_hex(ch2.hash, 2)
+                                        : std::string("needs a key or #"));
+    }
+
+    const std::string chats = ch2_ok ? "Public, " + cfg_.mc.ch_name : std::string("Public");
     if (!cfg_.mc.enabled) {
         text_note0_.set("Off.");
-        text_note1_.set("Chat: Ch > MeshCore Public");
-    } else if (mt.sf > 8 || p.sf > 8 || p.sf < 7) {
-        text_note0_.set("Send only: hearing both needs");
-        text_note1_.set("SF7/8 on both (NARROW presets)");
-    } else if (off <= -1100000 || off >= 300000) {
-        text_note0_.set("Send only: too far from the");
-        text_note1_.set("Meshtastic channel to hear both");
+        text_note1_.set(("Chats: " + chats).substr(0, 30));
+    } else if (const char* why = mc_rx_problem_of(cfg_)) {
+        text_note0_.set("Send only, not heard:");
+        text_note1_.set(why);
     } else {
         text_note0_.set("Heard alongside Meshtastic.");
-        text_note1_.set("Chat: Ch > MeshCore Public");
+        text_note1_.set(("Chats: " + chats).substr(0, 30));
     }
 }
 
@@ -5474,7 +5601,12 @@ const SettingDef SETTING_DEFS[] = {
     {"mc_preset"sv, offsetof(MeshSettings, mc.preset), K::U8},
     {"mc_freq"sv, offsetof(MeshSettings, mc.freq_hz), K::U32},
     {"mc_name"sv, offsetof(MeshSettings, mc.name), K::STR},
-    {"mc_open"sv, offsetof(MeshSettings, mc.open), K::BOOL},
+    {"mc_open"sv, offsetof(MeshSettings, mc.open), K::U8},
+    {"mc_sf"sv, offsetof(MeshSettings, mc.sf), K::U8},
+    {"mc_bw"sv, offsetof(MeshSettings, mc.bw_hz), K::U32},
+    {"mc_cr"sv, offsetof(MeshSettings, mc.cr), K::U8},
+    {"mc_ch"sv, offsetof(MeshSettings, mc.ch_name), K::STR},
+    {"mc_key"sv, offsetof(MeshSettings, mc.ch_key), K::STR},
 };
 }  // namespace
 
@@ -5855,8 +5987,8 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
         queue_tx(data, len, true);  // typed by the user: never drop it for a relay
         arm_retry(data, len);       // repeat it until the receipt comes back
     });
-    chat_view_.set_on_mc_tx_request([this](const std::string& text) {
-        return send_meshcore_text(text);
+    chat_view_.set_on_mc_tx_request([this](const std::string& text, uint8_t channel) {
+        return send_meshcore_text(text, channel);
     });
 
     // Open the telemetry-override config from the Map tab.
@@ -5933,7 +6065,8 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     auto open_channels = [this, open_dm]() {
         auto* v = nav_.push<MeshtasticChannelsView>(cfg_.preset_idx, cfg_.region_idx, cfg_.freq_slot, active_coding_rate(), cfg_.ch_name, cfg_.ch_key, cfg_.ch_enabled, &cfg_.active_channel, &cfg_.primary_name, node_db_, chat_view_.open_dm(), [this]() { apply_channels(); persist(); }, open_dm, [this]() { return random_channel_key(); });
         v->set_on_bell([this](uint8_t channel, uint32_t node) { send_bell(channel, node); });
-        v->set_meshcore(cfg_.mc.enabled, cfg_.mc.open && !chat_view_.open_dm(), [this](bool open) {
+        v->set_meshcore(cfg_.mc.enabled, chat_view_.open_dm() ? 0 : cfg_.mc.open,
+                        mc_second_ok_ ? cfg_.mc.ch_name : std::string(), [this](uint8_t open) {
             cfg_.mc.open = open;
             apply_channels();
             persist();
@@ -6201,43 +6334,35 @@ LoRaConfigureMessage MeshtasticView::rx_lora_config() const {
 
 // ---- MeshCore ----------------------------------------------------------------
 
-const meshcore::Preset& MeshtasticView::mc_preset() const {
-    return meshcore::PRESETS[cfg_.mc.preset < meshcore::NUM_PRESETS ? cfg_.mc.preset : 0];
+meshcore::Preset MeshtasticView::mc_preset() const {
+    return mc_modem_of(cfg_);
 }
 
 // Where the Meshtastic channel is, and so where the receiver is tuned.
 uint32_t MeshtasticView::mt_frequency() const {
-    return (cfg_.freq_override_hz != 0)
-               ? cfg_.freq_override_hz
-               : static_cast<uint32_t>(channel_frequency(cfg_.region_idx, cfg_.preset_idx, cfg_.freq_slot,
-                                                         cfg_.primary_name.c_str()));
+    return mt_freq_of(cfg_);
 }
 
 uint32_t MeshtasticView::mc_frequency() const {
-    return cfg_.mc.freq_hz ? cfg_.mc.freq_hz : mc_preset().freq_hz;
+    return mc_freq_of(cfg_);
 }
 
-// The baseband's own conditions for a second demodulator (LoRaProcessor::configure):
-// both chains streaming at SF7/8 so they share its sample ring, and the MeshCore channel
-// inside the receiver's band.
 const char* MeshtasticView::mc_rx_problem() const {
-    const auto& mt = MODEM_PRESETS[cfg_.preset_idx];
-    const auto& p = mc_preset();
-    auto narrow_enough = [](uint8_t sf, uint32_t bw) {
-        return sf >= 7 && sf <= 8 && (bw == 62500 || bw == 125000 || bw == 250000);
-    };
-    if (!narrow_enough(mt.sf, mt.bw_hz)) return "needs a SF7/8 Meshtastic preset";
-    if (!narrow_enough(p.sf, p.bw_hz)) return "MeshCore preset is not SF7/8";
-    const int64_t off = static_cast<int64_t>(mc_frequency()) - static_cast<int64_t>(mt_frequency());
-    if (off <= -1100000 || off >= 300000) return "too far from Meshtastic";
-    return nullptr;
+    return mc_rx_problem_of(cfg_);
 }
 
 bool MeshtasticView::mc_rx_possible() const {
     return mc_rx_problem() == nullptr;
 }
 
-uint32_t MeshtasticView::send_meshcore_text(const std::string& text) {
+// The group channels as configured: Public always, the second one when it is usable.
+void MeshtasticView::apply_meshcore_channels() {
+    mc_second_ok_ = mc_second_channel_of(cfg_, mc_second_);
+    if (!mc_second_ok_ && cfg_.mc.open == 2) cfg_.mc.open = 1;
+    chat_view_.set_mc_second_name(cfg_.mc.ch_name);
+}
+
+uint32_t MeshtasticView::send_meshcore_text(const std::string& text, uint8_t channel) {
     if (!cfg_.mc.enabled) {
         chat_view_.write_console("* MeshCore is off: Setup > MeshCore\n");
         return 0;
@@ -6249,7 +6374,9 @@ uint32_t MeshtasticView::send_meshcore_text(const std::string& text) {
     if (overhead + n > meshcore::MAX_PAYLOAD) n = (overhead < meshcore::MAX_PAYLOAD) ? meshcore::MAX_PAYLOAD - overhead : 0;
     while (n && n < text.size() && (static_cast<uint8_t>(text[n]) & 0xC0) == 0x80) n--;
     uint8_t* const buf = pkt_scratch;
-    const size_t len = meshcore::build_group_text(mc_public_, now_unix(), sender.c_str(),
+    const bool second = (channel == MeshtasticChatView::MC_CHANNEL2);
+    if (second && !mc_second_ok_) return 0;
+    const size_t len = meshcore::build_group_text(second ? mc_second_ : mc_public_, now_unix(), sender.c_str(),
                                                   text.data(), n, buf, sizeof(pkt_scratch));
     if (!len) return 0;
     meshcore::Header h;
@@ -6285,8 +6412,15 @@ void MeshtasticView::on_meshcore_packet(const LoRaPacketMessage* msg) {
     if (h.type == meshcore::TYPE_GRP_TXT) {
         // Static: two hundred bytes this deep in the receive path is stack the M0 lacks.
         static meshcore::GroupText g;
-        if (meshcore::open_group_text(mc_public_, h, g)) {
-            chat_view_.on_meshcore_text(std::string(g.body, g.has_sender ? g.sender_len : 0),
+        // Public first, then the second channel: the hash byte picks the candidate and
+        // the MAC decides, so a channel that merely shares the hash is not mistaken.
+        uint8_t ch = 0;
+        if (meshcore::open_group_text(mc_public_, h, g))
+            ch = MeshtasticChatView::MC_CHANNEL;
+        else if (mc_second_ok_ && meshcore::open_group_text(mc_second_, h, g))
+            ch = MeshtasticChatView::MC_CHANNEL2;
+        if (ch) {
+            chat_view_.on_meshcore_text(ch, std::string(g.body, g.has_sender ? g.sender_len : 0),
                                         std::string(g.text()), msg->rssi, h.hops, false);
         } else {
             chat_view_.write_console("* MC: text on another channel (" +
@@ -6349,6 +6483,7 @@ void MeshtasticView::start_deferred() {
     // MeshCore's public channel: a hash of its key, so worked out once, here, where the
     // stack is shallow.
     meshcore::make_channel(meshcore::PUBLIC_KEY, sizeof(meshcore::PUBLIC_KEY), mc_public_);
+    apply_meshcore_channels();
     if (cfg_.mc.enabled) {
         const char* why = mc_rx_problem();
         chat_view_.write_console(std::string("* MeshCore on, ") + fmt_freq_mhz(mc_frequency()) +
@@ -7521,12 +7656,14 @@ void MeshtasticView::apply_channels() {
     // its own passphrase is truly private -> closed green padlock.
     chat_view_.set_encrypted(cfg_.active_channel != 0 &&
                              !cfg_.ch_key[cfg_.active_channel - 1].empty());
+    apply_meshcore_channels();
     if (cfg_.mc.enabled && cfg_.mc.open) {
-        // The chat is on MeshCore's public channel; Meshtastic keeps its active channel
-        // for everything it sends on its own.
-        chat_view_.set_channel_label("MC:P");
-        chat_view_.set_encrypted(false);
-        chat_view_.set_channel_index(MeshtasticChatView::MC_CHANNEL);
+        // The chat is on a MeshCore channel; Meshtastic keeps its active channel for
+        // everything it sends on its own.
+        const bool second = (cfg_.mc.open == 2);
+        chat_view_.set_channel_label(second ? "MC:2" : "MC:P");
+        chat_view_.set_encrypted(second && !cfg_.mc.ch_key.empty());
+        chat_view_.set_channel_index(second ? MeshtasticChatView::MC_CHANNEL2 : MeshtasticChatView::MC_CHANNEL);
         return;
     }
     chat_view_.set_channel_index(cfg_.active_channel);

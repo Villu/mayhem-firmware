@@ -78,6 +78,10 @@ struct Channel {
 bool make_channel(const uint8_t* key, size_t key_len, Channel& out);
 // "#name" channels: the key is the first 16 bytes of SHA-256 of the name, '#' included.
 bool hashtag_channel(const char* name, Channel& out);
+// A channel secret as people pass it around: 32 or 64 hex digits (what the apps show),
+// or base64 (what the firmware's addChannel takes). Returns the key length, 16 or 32,
+// or 0 when the text is neither.
+size_t parse_key(const char* text, uint8_t out[32]);
 
 // The fixed part of every packet: header byte, optional transport codes, path.
 struct Header {

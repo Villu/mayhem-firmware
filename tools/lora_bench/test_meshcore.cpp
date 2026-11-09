@@ -119,6 +119,30 @@ int main() {
                     "a 160-character text fits and round-trips");
     }
 
+    {  // channel keys as typed in: the docs' hashtag example, hex and base64 forms
+        Channel t;
+        hashtag_channel("#test", t);
+        ok &= check(!memcmp(t.secret, unhex("9cd8fcf22a47333b591d96a2b848b73f").data(), 16),
+                    "#test key = docs/companion_protocol.md example");
+        uint8_t k[32];
+        ok &= check(parse_key("8b3387e9c5cdea6ac9e5edbaa115cd72", k) == 16 && !memcmp(k, PUBLIC_KEY, 16),
+                    "parse_key: 32 hex digits");
+        ok &= check(parse_key("8B3387E9C5CDEA6AC9E5EDBAA115CD72", k) == 16 && !memcmp(k, PUBLIC_KEY, 16),
+                    "parse_key: upper-case hex");
+        ok &= check(parse_key("izOH6cXN6mrJ5e26oRXNcg==", k) == 16 && !memcmp(k, PUBLIC_KEY, 16),
+                    "parse_key: base64, 16 bytes");
+        const auto k32 = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        ok &= check(parse_key("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", k) == 32 &&
+                        !memcmp(k, k32.data(), 32),
+                    "parse_key: 64 hex digits");
+        ok &= check(parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", k) == 32 && !memcmp(k, k32.data(), 32),
+                    "parse_key: base64, 32 bytes");
+        ok &= check(parse_key("", k) == 0 && parse_key("hello", k) == 0 &&
+                        parse_key("8b3387e9c5cdea6ac9e5edbaa115cd7", k) == 0 &&
+                        parse_key("izOH6cXN6mrJ5e26oRXN", k) == 0 && parse_key("izOH=cXN6mrJ5e26oRXNcg==", k) == 0,
+                    "parse_key: refuses short, odd and malformed text");
+    }
+
     printf("\n%s\n", ok ? "ALL PASS" : "SOME FAILED");
     return ok ? 0 : 1;
 }

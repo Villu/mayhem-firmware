@@ -193,6 +193,61 @@ bool hashtag_channel(const char* name, Channel& out) {
     return make_channel(h, 16, out);
 }
 
+size_t parse_key(const char* text, uint8_t out[32]) {
+    if (!text) return 0;
+    const size_t n = strlen(text);
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    if (n == 32 || n == 64) {
+        bool ok = true;
+        for (size_t i = 0; i < n && ok; i++) ok = hex(text[i]) >= 0;
+        if (ok) {
+            for (size_t i = 0; i < n / 2; i++)
+                out[i] = static_cast<uint8_t>((hex(text[2 * i]) << 4) | hex(text[2 * i + 1]));
+            return n / 2;
+        }
+    }
+    // Base64: 24 characters for 16 bytes, 44 for 32, '=' padding only at the end.
+    if (n == 0 || n % 4 != 0) return 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t len = 0;
+    bool pad = false;
+    for (size_t i = 0; i < n; i++) {
+        const char c = text[i];
+        int v;
+        if (c == '=') {
+            pad = true;
+            continue;
+        }
+        if (pad) return 0;
+        if (c >= 'A' && c <= 'Z')
+            v = c - 'A';
+        else if (c >= 'a' && c <= 'z')
+            v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9')
+            v = c - '0' + 52;
+        else if (c == '+' || c == '-')
+            v = 62;
+        else if (c == '/' || c == '_')
+            v = 63;
+        else
+            return 0;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (len >= 32) return 0;
+            out[len++] = static_cast<uint8_t>(acc >> bits);
+        }
+    }
+    return (len == 16 || len == 32) ? len : 0;
+}
+
 // ---- Packets ---------------------------------------------------------------------
 
 bool parse(const uint8_t* pkt, size_t len, Header& out) {
