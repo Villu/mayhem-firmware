@@ -248,9 +248,20 @@ constexpr CONCAT_ORDER data_concat_order(
 
 constexpr CLK_CAPTURE_MODE data_clk_capture_mode(
     const Direction direction) {
+#ifdef PRALINE
+    /* TX: shift each byte out on the falling edge of the FPGA's byte clock. The gateware
+     * (fpga/interface/sgpio.py) raises the clock for the first half of its HFOSC cycle and
+     * latches the byte a fixed number of cycles later. On the rising edge the byte changed
+     * close to that latch, so the FPGA sometimes paired Q(n-1) with I(n) and a whole
+     * transmission went out with I and Q swapped. */
+    return (direction == Direction::Transmit)
+               ? CLK_CAPTURE_MODE::FALLING_CLOCK_EDGE
+               : CLK_CAPTURE_MODE::RISING_CLOCK_EDGE;
+#else
     return (direction == Direction::Transmit)
                ? CLK_CAPTURE_MODE::RISING_CLOCK_EDGE
                : CLK_CAPTURE_MODE::RISING_CLOCK_EDGE;
+#endif
 }
 
 constexpr P_OUT_CFG data_p_out_cfg(
