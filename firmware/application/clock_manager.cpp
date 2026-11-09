@@ -64,6 +64,11 @@ static_assert(si5351_inputs.f_clkin_out() == si5351_clkin_f, "CLKIN output frequ
 constexpr si5351::PLLInputSource::Type si5351c_pll_input_sources{
     si5351::PLLInputSource::PLLA_Source_XTAL | si5351::PLLInputSource::PLLB_Source_CLKIN | si5351::PLLInputSource::CLKIN_Div1};
 
+#ifdef PRALINE
+constexpr si5351::PLLInputSource::Type si5351c_pll_input_sources_both_clkin{
+    si5351::PLLInputSource::PLLA_Source_CLKIN | si5351::PLLInputSource::PLLB_Source_CLKIN | si5351::PLLInputSource::CLKIN_Div1};
+#endif
+
 constexpr si5351::PLLInputSource::Type si5351a_pll_input_sources{
     si5351::PLLInputSource::PLLA_Source_XTAL | si5351::PLLInputSource::PLLB_Source_XTAL | si5351::PLLInputSource::CLKIN_Div1};
 
@@ -453,7 +458,8 @@ void ClockManager::init_clock_generator() {
 
     /*
      * Match the HackRF One init flow:
-     * 1. PLLA stays on the local 25MHz crystal.
+     * 1. PLLA starts on the local 25MHz crystal (moved to CLKIN below when the
+     *    reference is CLKIN, then it drives only CLK0/CLK1).
      * 2. PLLB is configured from the Si5351 CLKIN pin.
      * 3. CLK2 temporarily drives GP_CLKIN directly from CLKIN so we can
      *    detect whether P22 is carrying a valid 10MHz reference.
@@ -482,12 +488,17 @@ void ClockManager::init_clock_generator() {
      * leaves that relation to chance unless the PLL driving them is reset afterwards, which is
      * what the reference firmware does (clock_gen.c: "Reset PLL to synchronize output clock
      * phase"). Here the MCU clock (CLK2) shares the reference PLL, so that PLL must not be
-     * reset at run time. When the reference is CLKIN (PLL B), PLL A - the local crystal, which
-     * nothing else uses then - is given to CLK0 and CLK1 alone and reset on every rate change.
-     * Without this every other start of the radio came up with I and Q swapped: a mirrored
-     * spectrum, invisible to AM/FM, fatal to LoRa (half of all packets never detected). */
+     * reset at run time. When the reference is CLKIN (PLL B), PLL A, which nothing else uses
+     * then, is fed from the same CLKIN with the same settings as PLL B and given to CLK0 and
+     * CLK1 alone, so it can be reset on every rate change while the sample clocks stay on the
+     * selected reference. Without this every other start of the radio came up with I and Q
+     * swapped: a mirrored spectrum, invisible to AM/FM, fatal to LoRa (half of all packets
+     * never detected). */
     _datapath_pll_a = (ref_pll == ClockControl::MultiSynthSource::PLLB);
     const auto datapath_pll = _datapath_pll_a ? ClockControl::MultiSynthSource::PLLA : ref_pll;
+    if (_datapath_pll_a) {
+        clock_generator.set_pll_input_sources(si5351c_pll_input_sources_both_clkin);
+    }
 
     const ClockControls si5351_clock_control = ClockControls{{
         si5351_clock_control_common[0].ms_src(datapath_pll),
@@ -544,7 +555,7 @@ void ClockManager::init_clock_generator() {
 #endif
 
 #ifdef PRALINE
-    clock_generator.write_pll_single_byte(0, si5351_pll_a_afe_800m);
+    clock_generator.write_pll_single_byte(0, _datapath_pll_a ? si5351_pll_clkin_10m : si5351_pll_a_afe_800m);
 
     {
         const auto& pll_b = si5351c_pll_b_clkin_reg;
@@ -615,8 +626,9 @@ void ClockManager::init_clock_generator() {
 
     // Wait for PLL(s) to lock.
 #ifdef PRALINE
+    // With a CLKIN reference both PLLs are in use: PLL B for the system, PLL A for CLK0/CLK1.
     uint8_t device_status_mask =
-        (ref_pll == ClockControl::MultiSynthSource::PLLB) ? 0x40 : 0x20;
+        (ref_pll == ClockControl::MultiSynthSource::PLLB) ? 0x60 : 0x20;
     uint32_t pll_timeout = 100000;
     while ((clock_generator.device_status() & device_status_mask) != 0 && pll_timeout > 0) {
         pll_timeout--;
@@ -944,11 +956,6 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
     }
 
     if (_datapath_pll_a) {
-        // The reference delays FPGA_CLK against AFE_CLK (clock_gen.c si5351c_set_phase(1, ...))
-        // so the FPGA's DDR data to the DAC changes half a clock away from where the MAX5864
-        // samples it. Register 166 = CLK1 phase offset in quarter VCO periods (0.3125 ns at
-        // 800 MHz); 42 = ~13 ns, the value the reference arrives at for the 80 MHz multisynth
-        // behind a 40 MHz AFE clock. Takes effect at the PLL reset below.
         // Restart CLK0 and CLK1 in step (see init_clock_generator), wait for the lock.
         clock_generator.reset_pll_a();
         uint32_t pll_timeout = 100000;
@@ -983,6 +990,12 @@ void ClockManager::set_reference_ppb(const int32_t ppb) {
     // On Praline, only apply if we aren't locked to a superior external 10MHz source
     // (Assuming you have a way to detect the 10MHz presence on Praline)
     if (reference.source == ReferenceSource::External) {
+        return;
+    }
+    // PLL A runs from CLKIN then (see init_clock_generator), not from the crystal this
+    // correction is computed for. Nothing used PLL A with a CLKIN reference before, so
+    // skipping keeps the correction exactly as ineffective as it always was there.
+    if (_datapath_pll_a) {
         return;
     }
     constexpr uint32_t pll_multiplier = si5351_pll_a_afe_800m.a;
