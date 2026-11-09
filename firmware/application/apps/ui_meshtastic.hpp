@@ -32,6 +32,10 @@
 #include "apps/mesh/mesh_pki.hpp"
 #include "apps/mesh/meshcore.hpp"
 
+#ifndef MC_UI_TEST
+#define MC_UI_TEST 0  // 1 = debug: feed a real MeshCore advert ~10 s after start (no node needed)
+#endif
+
 #include <string>
 #include <vector>
 #include <memory>
@@ -1214,6 +1218,21 @@ class MeshtasticChatView : public View {
 
 // A share code the size of the screen: a phone reads it from across the room, which
 // is the whole point of handing someone a channel key at a meet-up.
+// A MeshCore node from its adverts: what the network says about it. Read-only - there are
+// no MeshCore direct messages here.
+class MeshCoreNodeView : public View {
+   public:
+    MeshCoreNodeView(NavigationView& nav, const meshcore::NodeList::Entry& e, uint32_t now_ticks);
+    std::string title() const override { return "MeshCore"; }
+    void focus() override { button_close_.focus(); }
+    void paint(Painter& painter) override;
+
+   private:
+    meshcore::NodeList::Entry e_;
+    uint32_t now_ticks_;
+    Button button_close_{{0, 272, screen_width, 32}, "Close"};
+};
+
 class MeshtasticQRView : public View {
    public:
     // caption lines describe what the code carries (node name, board, key state), so a
@@ -1422,6 +1441,12 @@ class MeshtasticNodesView : public View {
         if (!hidden() && ticks >= now_ticks_ + 60) set_dirty();
         now_ticks_ = ticks;
     }
+    // MeshCore nodes, listed under their own heading after the Meshtastic ones. Owned by
+    // the app (allocated with the first MeshCore advert); nullptr = none yet.
+    void set_meshcore_nodes(const meshcore::NodeList* list) {
+        mc_nodes_ = list;
+        set_dirty();
+    }
 
    private:
     static constexpr int SV_H = 280;
@@ -1458,6 +1483,11 @@ class MeshtasticNodesView : public View {
     uint32_t forget_after_min_{0};
     // Order (indices into the node DB) rebuilt whenever the list is drawn.
     std::vector<uint8_t> order_{};
+    // The MeshCore rows: a heading, then the nodes newest first (indices into mc_nodes_).
+    const meshcore::NodeList* mc_nodes_{nullptr};
+    uint8_t mc_order_[meshcore::NodeList::MAX]{};
+    size_t mc_count_{0};
+    size_t total_rows() const { return order_.size() + (mc_count_ ? mc_count_ + 1 : 0); }
 
     void rebuild_order();
     void toggle_sort(Sort key);
@@ -2302,6 +2332,12 @@ class MeshtasticView : public View {
     meshcore::Channel mc_public_{};
     meshcore::Channel mc_second_{};  // MeshCoreSettings::ch_name / ch_key
     bool mc_second_ok_{false};
+    // MeshCore nodes heard (adverts). Allocated with the first one, so it costs nothing
+    // while MeshCore is off; shown on the Nodes tab under its own heading.
+    std::unique_ptr<meshcore::NodeList> mc_nodes_{};
+#if MC_UI_TEST
+    void mc_ui_test_inject();
+#endif
     // Recently heard packets, by content signature: the same message arrives once from
     // its sender and again from every repeater that floods it on.
     static constexpr size_t MC_SEEN = 16;

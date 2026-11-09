@@ -136,8 +136,37 @@ struct AdvertInfo {
     int32_t lat_e6{0}, lon_e6{0};
     char name[MAX_SENDER_NAME + 1]{};
     uint8_t key_prefix{0};  // first byte of the public key = its hash in paths
+    uint8_t id[6]{};        // first six bytes of the public key: how the apps tell nodes apart
 };
 bool read_advert(const Header& h, AdvertInfo& out);
+const char* node_type_name(uint8_t node_type);  // "companion", "repeater", ...
+
+// The MeshCore nodes heard, from their adverts: a few, kept apart from Meshtastic's node
+// table (other identities, no routing role). Full: the one heard longest ago gives way.
+class NodeList {
+   public:
+    static constexpr size_t MAX = 8;
+    static constexpr size_t NAME_LEN = 24;  // a MeshCore name is up to 31; the list shows 14
+    struct Entry {
+        uint8_t id[6];
+        char name[NAME_LEN + 1];
+        uint8_t type;
+        uint8_t hops;
+        bool has_location;
+        int8_t rssi;
+        int16_t snr_tenths;
+        int32_t lat_e6, lon_e6;
+        uint32_t last_seen;  // caller's clock (app ticks); 0 = unused slot
+    };
+    // Record an advert. Returns true when the node is new to the list.
+    bool update(const AdvertInfo& a, int8_t rssi, int16_t snr_tenths, uint8_t hops, uint32_t now);
+    size_t count() const { return count_; }
+    const Entry& at(size_t i) const { return e_[i]; }
+
+   private:
+    Entry e_[MAX]{};
+    size_t count_{0};
+};
 
 // Building blocks, public so the host test can reach them.
 void aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);

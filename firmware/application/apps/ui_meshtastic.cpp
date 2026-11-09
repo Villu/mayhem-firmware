@@ -3311,6 +3311,16 @@ void MeshtasticNodesView::rebuild_order() {
         }
         order_[j] = v;
     }
+    // MeshCore nodes: newest first, whatever the Meshtastic list is sorted by.
+    mc_count_ = mc_nodes_ ? mc_nodes_->count() : 0;
+    for (size_t i = 0; i < mc_count_; i++) {
+        size_t j = i;
+        while (j > 0 && mc_nodes_->at(mc_order_[j - 1]).last_seen < mc_nodes_->at(i).last_seen) {
+            mc_order_[j] = mc_order_[j - 1];
+            j--;
+        }
+        mc_order_[j] = static_cast<uint8_t>(i);
+    }
 }
 
 void MeshtasticNodesView::update_sort_caption() {
@@ -3351,7 +3361,7 @@ void MeshtasticNodesView::focus() {
 }
 
 void MeshtasticNodesView::move_selection(int delta) {
-    const size_t total = order_.size();
+    const size_t total = total_rows();
     if (total == 0) return;
     int sel = static_cast<int>(selected_) + delta;
     if (sel < 0) sel = 0;
@@ -3367,7 +3377,11 @@ void MeshtasticNodesView::move_selection(int delta) {
 }
 
 void MeshtasticNodesView::open_selected() {
-    if (selected_ >= order_.size()) return;
+    if (selected_ > order_.size() && selected_ < total_rows() && mc_nodes_) {  // a MeshCore row
+        nav_.push<MeshCoreNodeView>(mc_nodes_->at(mc_order_[selected_ - order_.size() - 1]), now_ticks_);
+        return;
+    }
+    if (selected_ >= order_.size()) return;  // the MeshCore heading, or nothing
     const NodeEntry* e = node_db_.at(order_[selected_]);
     if (!e || !e->active) return;
     auto* v = nav_.push<MeshtasticNodeDetailView>(node_db_, e->node_id, on_message_,
@@ -3377,7 +3391,7 @@ void MeshtasticNodesView::open_selected() {
 
 bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
     if (delta == 0) return true;
-    if (delta > 0 && selected_ + 1 >= order_.size()) return false;  // out to the buttons
+    if (delta > 0 && selected_ + 1 >= total_rows()) return false;  // out to the buttons
     // At the top of the list, scrolling further up releases focus so the tab bar
     // (and thus leaving the Nodes list) is reachable again - otherwise the list
     // traps the encoder and you can never navigate away.
@@ -3424,7 +3438,7 @@ bool MeshtasticNodesView::on_touch(const TouchEvent event) {
     const int list_rel = rel - HDR_H;
     if (list_rel >= 0 && list_rel < VISIBLE * ROW_H) {
         const size_t row = scroll_offset_ + static_cast<size_t>(list_rel / ROW_H);
-        if (row < order_.size()) {
+        if (row < total_rows()) {
             selected_ = row;
             set_dirty();
             open_selected();
@@ -3462,11 +3476,10 @@ void MeshtasticNodesView::paint(Painter& painter) {
     };
 
     rebuild_order();
+    const size_t total = total_rows();
     for (size_t i = 0; i < static_cast<size_t>(VISIBLE); i++) {
         const size_t pos = i + scroll_offset_;
-        if (pos >= order_.size()) break;
-        const NodeEntry* e = node_db_.at(order_[pos]);
-        if (!e) continue;
+        if (pos >= total) break;
 
         // The highlight marks where the encoder is, so it appears once the list has
         // focus. Drawn unconditionally it covered the first node from the start, hiding
@@ -3475,6 +3488,25 @@ void MeshtasticNodesView::paint(Painter& painter) {
         const int y = y0 + HDR_H + static_cast<int>(i) * ROW_H;
         painter.fill_rectangle({x0, y, screen_width, ROW_H}, sel ? Color::blue() : bg);
         const Style st = sel ? Style{hdr.font, Color::blue(), Color::white()} : hdr;
+
+        if (pos >= order_.size()) {  // the other network: a heading, then its nodes
+            if (pos == order_.size()) {
+                painter.draw_string({x0, y}, Style{hdr.font, sel ? Color::blue() : bg, Color::cyan()},
+                                    "-- MeshCore (other network) --");
+                continue;
+            }
+            const auto& m = mc_nodes_->at(mc_order_[pos - order_.size() - 1]);
+            std::string sig = m.rssi ? to_string_dec_int(m.rssi) : "--";
+            sig.resize(4, ' ');
+            painter.draw_string({x0, y}, st, to_string_hex(m.id[0], 2) + to_string_hex(m.id[1], 2));
+            draw_utf8({x0 + 5 * 8, y}, utf8_cols(m.name[0] ? std::string(m.name) : std::string("?"), 14),
+                      st.foreground, st.background);
+            painter.draw_string({x0 + 20 * 8, y}, st, sig + " " + fmt_age(m.last_seen));
+            painter.fill_rectangle({x0 + screen_width - 6, y + 1, 5, ROW_H - 2}, Color::cyan());
+            continue;
+        }
+        const NodeEntry* e = node_db_.at(order_[pos]);
+        if (!e) continue;
 
         std::string id = to_string_hex(e->node_id, 8).substr(4, 4);
         std::string name = e->long_name[0] ? std::string(e->long_name)
@@ -3502,7 +3534,8 @@ void MeshtasticNodesView::paint(Painter& painter) {
     painter.draw_string({x0, y0 + FOOT_Y}, hdr,
                         "Nodes:" + to_string_dec_uint(static_cast<uint32_t>(order_.size())) +
                             "/" + to_string_dec_uint(static_cast<uint32_t>(meshtastic::MAX_NODES)) +
-                            "  Online:" + to_string_dec_uint(static_cast<uint32_t>(online_count())));
+                            "  Online:" + to_string_dec_uint(static_cast<uint32_t>(online_count())) +
+                            (mc_count_ ? "  MC:" + to_string_dec_uint(static_cast<uint32_t>(mc_count_)) : std::string()));
 }
 
 void MeshtasticNodesView::refresh() {
@@ -4616,6 +4649,54 @@ void MeshtasticChannelsView::randomize_key() {
     *active_ = static_cast<uint8_t>(i + 1);
     if (on_change_) on_change_();
     set_dirty();
+}
+
+MeshCoreNodeView::MeshCoreNodeView(NavigationView& nav, const meshcore::NodeList::Entry& e, uint32_t now_ticks)
+    : e_(e), now_ticks_(now_ticks) {
+    add_children({&button_close_});
+    button_close_.on_select = [&nav](Button&) { nav.pop(); };
+}
+
+void MeshCoreNodeView::paint(Painter& painter) {
+    const auto r = screen_rect();
+    const auto& fg = *Theme::getInstance()->fg_light;
+    const auto& dim = *Theme::getInstance()->fg_medium;
+    const int x0 = r.left();
+    int y = r.top() + 8;
+    painter.fill_rectangle({x0, r.top(), screen_width, 264}, Theme::getInstance()->bg_darkest->background);
+    auto line = [&](const std::string& s, const Style& st = *Theme::getInstance()->fg_light) {
+        painter.draw_string({x0, y}, st, s.substr(0, 30));
+        y += 20;
+    };
+    // e6 degrees as text, exactly: "-122.108616"
+    auto coord = [](int32_t v) {
+        const uint32_t a = static_cast<uint32_t>(v < 0 ? -static_cast<int64_t>(v) : v);
+        std::string frac = to_string_dec_uint(a % 1000000u);
+        frac.insert(0, 6 - frac.size(), '0');
+        return std::string(v < 0 ? "-" : "") + to_string_dec_uint(a / 1000000u) + "." + frac;
+    };
+    painter.draw_string({x0, y}, dim, "Name:");
+    draw_utf8({x0 + 6 * 8, y}, utf8_cols(e_.name[0] ? std::string(e_.name) : std::string("(no name)"), 24),
+              fg.foreground, fg.background);
+    y += 20;
+    line(std::string("Type: ") + meshcore::node_type_name(e_.type));
+    std::string id;
+    for (uint8_t b : e_.id) id += to_string_hex(b, 2);
+    line("Key:  " + id + "..");
+    const uint32_t s = (now_ticks_ > e_.last_seen) ? (now_ticks_ - e_.last_seen) / 60 : 0;  // ~60 Hz
+    line("Heard: " + (s < 60 ? to_string_dec_uint(s) + " s" : s < 3600 ? to_string_dec_uint(s / 60) + " min" : to_string_dec_uint(s / 3600) + " h") + " ago");
+    line("Signal: " + (e_.rssi ? to_string_dec_int(e_.rssi) + " dBm" : std::string("--")) +
+         "  SNR " + to_string_decimal(e_.snr_tenths / 10.0f, 1));
+    line(e_.hops ? "Hops: " + to_string_dec_uint(e_.hops) : std::string("Heard directly"));
+    if (e_.has_location) {
+        line("Lat: " + coord(e_.lat_e6));
+        line("Lon: " + coord(e_.lon_e6));
+    } else {
+        line("Position: not sent");
+    }
+    y += 8;
+    line("Another network (MeshCore):", dim);
+    line("no direct messages to it.", dim);
 }
 
 MeshtasticQRView::MeshtasticQRView(NavigationView& nav, const std::string& text, std::string line1, std::string line2)
@@ -6429,9 +6510,16 @@ void MeshtasticView::on_meshcore_packet(const LoRaPacketMessage* msg) {
     } else if (h.type == meshcore::TYPE_ADVERT) {
         static meshcore::AdvertInfo a;
         if (meshcore::read_advert(h, a)) {
-            static const char* const kinds[5] = {"node", "chat", "repeater", "room", "sensor"};
-            chat_view_.write_console(std::string("* MC ") + kinds[a.node_type < 5 ? a.node_type : 0] +
-                                     ": " + (a.name[0] ? a.name : "(no name)") + "\n");
+            if (!mc_nodes_) {
+                mc_nodes_ = std::make_unique<meshcore::NodeList>();
+                nodes_view_.set_meshcore_nodes(mc_nodes_.get());
+            }
+            // Once per node, like the Meshtastic side: repeaters send their advert again
+            // and again, and a line for each would bury the chat.
+            if (mc_nodes_->update(a, msg->rssi, msg->snr_tenths, h.hops, uptime_ticks_))
+                chat_view_.write_console(std::string("* new MeshCore ") + meshcore::node_type_name(a.node_type) +
+                                         ": " + (a.name[0] ? a.name : "(no name)") + "\n");
+            nodes_view_.refresh();
         }
     } else {
         chat_view_.write_console(std::string("* MC ") + meshcore::type_name(h.type) + "\n");
@@ -6831,12 +6919,35 @@ void MeshtasticView::on_gps_update(const GPSPosDataMessage* msg) {
     }
 }
 
+#if MC_UI_TEST
+// DEBUG BUILD ONLY: a real repeater advert (tools/lora_bench/test_meshcore.cpp), fed
+// through the receive path from the timer - the depth a received packet arrives at -
+// so the MeshCore rows can be seen without a MeshCore node in range.
+__attribute__((noinline)) void MeshtasticView::mc_ui_test_inject() {
+    static const char hex[] =
+        "11007E7662676F7F0850A8A355BAAFBFC1EB7B4174C340442D7D7161C9474A2C94006CE7CF682E58408DD8FCC51906ECA98EBF94A0"
+        "37886BDADE7ECD09FD92B839491DF3809C9454F5286D1D3370AC31A34593D569E9A042A3B41FD331DFFB7E18599CE1E60992A076"
+        "D50238C5B8F85757375354522F50756765744D65736820436F75676172";
+    static LoRaPacketMessage m;
+    m.net = NET_MESHCORE;
+    m.crc_state = LoRaPacketMessage::CRC_OK;
+    m.rssi = -97;
+    m.snr_tenths = -35;
+    m.length = static_cast<uint8_t>((sizeof(hex) - 1) / 2);
+    for (size_t i = 0; i < m.length; i++) m.data[i] = static_cast<uint8_t>((hex_digit(hex[2 * i]) << 4) | hex_digit(hex[2 * i + 1]));
+    on_meshcore_packet(&m);
+}
+#endif
+
 void MeshtasticView::on_timer() {
     // The keyboard has no tick of its own: one handler per message, and this is it.
     mesh_text_entry_tick();
 
     uptime_ticks_++;
     nodes_view_.set_now(uptime_ticks_);  // live "last heard" ages
+#if MC_UI_TEST
+    if (uptime_ticks_ == 600u && cfg_.mc.enabled) mc_ui_test_inject();  // ~10 s after start
+#endif
     if ((uptime_ticks_ % 60u) == 0) {
         // Date evictions and park the nodes the table pushed out on the SD card (see MeshtasticSeenView).
         node_db_.set_clock(now_unix(), uptime_ticks_);

@@ -106,6 +106,37 @@ int main() {
         ok &= check(r && a.node_type == 2 && !strcmp(a.name, "WW7STR/PugetMesh Cougar") && a.has_location &&
                         a.lat_e6 == 47543968 && a.lon_e6 == -122108616 && a.key_prefix == 0x7E,
                     "repeater advert: type, name, location");
+        static const uint8_t id[6] = {0x7E, 0x76, 0x62, 0x67, 0x6F, 0x7F};
+        ok &= check(r && !memcmp(a.id, id, 6) && !strcmp(node_type_name(a.node_type), "repeater"),
+                    "advert id = first 6 key bytes");
+
+        NodeList list;
+        const bool first = list.update(a, -90, 55, 0, 100);
+        const bool again = list.update(a, -80, 60, 2, 200);
+        AdvertInfo nameless = a;
+        nameless.name[0] = 0;
+        nameless.has_location = false;
+        list.update(nameless, -70, 70, 1, 300);
+        const auto& e = list.at(0);
+        ok &= check(first && !again && list.count() == 1 && e.last_seen == 300 && e.rssi == -70 && e.hops == 1 &&
+                        !strcmp(e.name, "WW7STR/PugetMesh Cougar") && e.has_location && e.lat_e6 == 47543968,
+                    "node list: repeats update, a nameless advert keeps name and place");
+        for (uint8_t i = 1; i <= NodeList::MAX; i++) {  // fill up, then one more
+            AdvertInfo o = a;
+            o.id[5] = i;
+            o.name[0] = static_cast<char>('a' + i);
+            o.name[1] = 0;
+            list.update(o, -100, 0, 0, 1000 + i);
+        }
+        bool evicted_oldest = list.count() == NodeList::MAX;
+        for (size_t i = 0; i < list.count(); i++)
+            if (!memcmp(list.at(i).id, id, 6)) evicted_oldest = false;  // the first one, heard at 300
+        ok &= check(evicted_oldest, "node list: full, the longest-silent node gives way");
+        NodeList cut;
+        AdvertInfo u = a;
+        strcpy(u.name, "abcdefghijklmnopqrstuv\xF0\x9F\x8C\xB2x");  // 22 letters, a 4-byte emoji across byte 24
+        cut.update(u, 0, 0, 0, 1);
+        ok &= check(!strcmp(cut.at(0).name, "abcdefghijklmnopqrstuv"), "node list: a long name is cut between characters");
     }
     {  // too long to send
         uint8_t out[MAX_PACKET];

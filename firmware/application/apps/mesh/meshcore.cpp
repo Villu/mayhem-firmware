@@ -370,6 +370,7 @@ bool read_advert(const Header& h, AdvertInfo& out) {
     if (h.type != TYPE_ADVERT || h.payload_len < 101) return false;
     out = AdvertInfo{};
     out.key_prefix = h.payload[0];
+    memcpy(out.id, h.payload, sizeof(out.id));
     const uint8_t* app = h.payload + 100;
     const size_t app_len = h.payload_len - 100;
     const uint8_t flags = app[0];
@@ -391,6 +392,61 @@ bool read_advert(const Header& h, AdvertInfo& out) {
         out.name[n] = 0;
     }
     return true;
+}
+
+const char* node_type_name(uint8_t node_type) {
+    switch (node_type) {
+        case 1:
+            return "companion";
+        case 2:
+            return "repeater";
+        case 3:
+            return "room server";
+        case 4:
+            return "sensor";
+        default:
+            return "node";
+    }
+}
+
+bool NodeList::update(const AdvertInfo& a, int8_t rssi, int16_t snr_tenths, uint8_t hops, uint32_t now) {
+    size_t slot = MAX;
+    for (size_t i = 0; i < count_; i++)
+        if (!memcmp(e_[i].id, a.id, sizeof(a.id))) slot = i;
+    const bool is_new = (slot == MAX);
+    if (is_new) {
+        if (count_ < MAX) {
+            slot = count_++;
+        } else {
+            slot = 0;  // full: the one heard longest ago gives way
+            for (size_t i = 1; i < MAX; i++)
+                if (e_[i].last_seen < e_[slot].last_seen) slot = i;
+        }
+    }
+    Entry& e = e_[slot];
+    memcpy(e.id, a.id, sizeof(e.id));
+    // An advert without a name keeps the one already known.
+    if (a.name[0] || is_new) {
+        // Cut to fit on a character boundary: a name is UTF-8, often with an emoji.
+        const size_t full = strlen(a.name);
+        size_t n = (full > NAME_LEN) ? NAME_LEN : full;
+        while (n && n < full && (static_cast<uint8_t>(a.name[n]) & 0xC0) == 0x80) n--;
+        memcpy(e.name, a.name, n);
+        e.name[n] = 0;
+    }
+    e.type = a.node_type;
+    e.hops = hops;
+    if (a.has_location) {
+        e.has_location = true;
+        e.lat_e6 = a.lat_e6;
+        e.lon_e6 = a.lon_e6;
+    } else if (is_new) {
+        e.has_location = false;
+    }
+    e.rssi = rssi;
+    e.snr_tenths = snr_tenths;
+    e.last_seen = now ? now : 1;
+    return is_new;
 }
 
 }  // namespace meshcore
