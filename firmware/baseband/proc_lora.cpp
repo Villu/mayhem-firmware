@@ -1191,7 +1191,14 @@ uint8_t LoRaRxChain::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32
             const uint8_t nibble = lora::hamming_top4(pcw[c], cw_len);
             if (bi == 8) {
                 block_seen = true;
-                if (lora::hamming_encode(nibble, cw_len - 4) != static_cast<int>(pcw[c])) ++parity_bad;
+                // lora::hamming_encode(nibble, cw_len - 4), from its CR 4/8 code words: the
+                // shorter codes are their top bits, except 4/5, whose one parity bit
+                // covers all four data bits. (The M4 image has no room for the function.)
+                static constexpr uint8_t H84[16] = {0x00, 0x8B, 0x4E, 0xC5, 0x2D, 0xA6, 0x63, 0xE8,
+                                                    0x17, 0x9C, 0x59, 0xD2, 0x3A, 0xB1, 0x74, 0xFF};
+                uint32_t want = H84[nibble] >> (8 - cw_len);
+                if (cw_len == 5) want = (want & 0x1Eu) | ((0x6996u >> nibble) & 1u);
+                if (want != pcw[c]) ++parity_bad;
             }
             pnib[pc++] = nibble;
         }
@@ -1676,8 +1683,9 @@ void LoRaRxChain::sf11_consume() {
                 sf11_cfo_ramp_ = std::arg(sf11_cfo_acc_) / static_cast<float>(sf11_sps_);
                 sf11_recompute_ref(sf11_cfo_ramp_);
                 sf11_off0_ = static_cast<uint32_t>(((int)sf11_up_bin_ - tau) % N + N) % N;
+                // 2.25 symbols, exact: a symbol is a power of two of at least 128 samples.
                 sf11_h0_ = static_cast<uint32_t>((long)sf11_read_ +
-                                                 (long)llroundf(2.25f * sf11_sps_) - tau);
+                                                 (long)(sf11_sps_ * 9u / 4u) - tau);
                 // Resolve the tau mod-N/2 ambiguity before FINE (see RESOLVE state).
                 sf11_state_ = Sf11State::RESOLVE;
                 sf11_res_idx_ = 0;
@@ -1869,10 +1877,11 @@ void LoRaRxChain::configure(uint8_t sf, uint32_t bw, uint8_t cr, uint32_t node_i
         // takes the same threshold as SF7 at BW250, whose symbols are also 128 points.
         // NARROW_SLOW (256 points) stays with SF8 at BW250, which is unscaled.
         if (sf11_sps_ < sf11_out_per_buf_ || (bw62_ && sf11_sps_ <= 128u)) {
-            const float noise_here = logf(static_cast<float>(sf11_sps_)) /
-                                     static_cast<float>(sf11_sps_);
-            const float noise_sf11 = logf(2048.0f) / 2048.0f;
-            sf11_sharp_thr_ = SF11_SHARP_THR * (noise_here / noise_sf11);
+            // ln(sps)/sps over ln(2048)/2048. sps = 2^SF, so the logarithms are SF and 11
+            // times ln 2, which cancels - and logf, with the double-precision helpers it
+            // drags in, does not fit the 32 KiB M4 code area alongside a second chain.
+            sf11_sharp_thr_ = SF11_SHARP_THR * (static_cast<float>(spreading_factor * 2048u) /
+                                                static_cast<float>(11u * sf11_sps_));
         }
         // Above the stored reference's size the reference is generated on the fly and the
         // FFT moves to the front of the ring; the dechirp is cut into chunks small enough
@@ -1908,8 +1917,10 @@ void LoRaRxChain::configure(uint8_t sf, uint32_t bw, uint8_t cr, uint32_t node_i
     use_ldro_ = lora::ldro_needed(spreading_factor, bandwidth);
 
     const uint32_t dec_fs = static_cast<uint32_t>(baseband_fs) / DECIM;  // 1 MHz
-    samples_per_symbol = static_cast<uint32_t>(
-        ((uint64_t)chips_per_symbol * dec_fs + bandwidth / 2u) / bandwidth);
+    // round(chips * dec_fs / bw) in 32 bits (chips <= 4096, so chips * (dec_fs % bw) fits):
+    // a 64-bit division would bring a 700-byte library routine into the M4 image.
+    samples_per_symbol = chips_per_symbol * (dec_fs / bandwidth) +
+                         (chips_per_symbol * (dec_fs % bandwidth) + bandwidth / 2u) / bandwidth;
     os_ = (chips_per_symbol > 0) ? (samples_per_symbol / chips_per_symbol) : 1u;
 
     // Precompute the conjugate reference chirp for one symbol (sps samples):
@@ -1951,8 +1962,11 @@ LoRaProcessor::LoRaProcessor() {
     const float amp = 16383.0f;
     for (uint32_t k = 0; k < nco_lut_.size(); ++k) {
         const float ph = 2.0f * static_cast<float>(M_PI) * static_cast<float>(k) / static_cast<float>(nco_lut_.size());
-        const int16_t c = static_cast<int16_t>(lrintf(amp * cosf(ph)));
-        const int16_t sn = static_cast<int16_t>(lrintf(amp * sinf(ph)));
+        // Rounded by hand: lrintf would pull another libm function into an image that
+        // has to fit 32 KiB.
+        const float fc = amp * cosf(ph), fs = amp * sinf(ph);
+        const int16_t c = static_cast<int16_t>(fc + (fc < 0.0f ? -0.5f : 0.5f));
+        const int16_t sn = static_cast<int16_t>(fs + (fs < 0.0f ? -0.5f : 0.5f));
         nco_lut_[k] = static_cast<uint16_t>(c) | (static_cast<uint32_t>(static_cast<uint16_t>(sn)) << 16);
     }
 }
@@ -2018,7 +2032,14 @@ void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
     aux_.set_preamble(32);  // MeshCore at SF <= 8 (RadioLibWrapper::preambleLengthForSF)
     // Shift the second channel onto the spot the first one occupies (+fs/4 in the raw
     // stream, where the decimator's own quarter-rate shift expects it).
-    nco_step_ = static_cast<uint32_t>(-(static_cast<int64_t>(off) * 4294967296LL) / static_cast<int64_t>(baseband_fs));
+    // -off * 2^32 / fs, truncated toward zero like the 64-bit division it replaces (which
+    // brought a 700-byte library routine into an image that has to fit 32 KiB). With fs =
+    // 2 MHz that is |off| * 2^25 / 15625, taken in exact 32-bit steps for |off| < 1.1 MHz.
+    static_assert(baseband_fs == 2000000, "NCO step arithmetic assumes 2 MS/s");
+    const uint32_t a = static_cast<uint32_t>(off < 0 ? -off : off);
+    const uint32_t t = (a % 15625u) << 13;
+    const uint32_t mag = ((a / 15625u) << 25) + ((t / 15625u) << 12) + (((t % 15625u) << 12) / 15625u);
+    nco_step_ = (off > 0) ? 0u - mag : mag;
     nco_phase_ = 0;
     aux_on_ = aux_.streaming();
 }

@@ -317,6 +317,7 @@ macro(DeclareTargets chunk_tag name)
 		add_custom_command(
 			OUTPUT ${chunk_tag}.bin ${PROJECT_NAME}.img
 			COMMAND ${CMAKE_OBJCOPY} -O binary ${PROJECT_NAME}.elf ${chunk_tag}.bin
+			COMMAND ${CMAKE_COMMAND} -DBIN=${chunk_tag}.bin -DMAX=32768 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_m4_image_size.cmake
 			COMMAND ${LZ4} -f -9 ${chunk_tag}.bin ${PROJECT_NAME}.lz4
 			COMMAND ${MAKE_IMAGE_CHUNK} ${PROJECT_NAME}.lz4 ${chunk_tag} ${PROJECT_NAME}.img
 			DEPENDS ${PROJECT_NAME}.elf ${MAKE_IMAGE_CHUNK}
@@ -338,6 +339,7 @@ macro(DeclareTargets chunk_tag name)
 		add_custom_command(
 			OUTPUT ${chunk_tag}.bin ${PROJECT_NAME}.img sd_baseband/${chunk_tag}.img
 			COMMAND ${CMAKE_OBJCOPY} -O binary ${PROJECT_NAME}.elf ${chunk_tag}.bin
+			COMMAND ${CMAKE_COMMAND} -DBIN=${chunk_tag}.bin -DMAX=32768 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_m4_image_size.cmake
 			COMMAND ${LZ4} -f -9 ${chunk_tag}.bin ${PROJECT_NAME}.lz4
 			COMMAND ${MAKE_IMAGE_CHUNK} ${PROJECT_NAME}.lz4 ${chunk_tag} ${PROJECT_NAME}.img
 			COMMAND ${CMAKE_COMMAND} -E make_directory sd_baseband
@@ -410,7 +412,9 @@ set(add_to_firmware TRUE)
 ### LoRa RX (Meshtastic)
 
 
-set(MODE_FLAGS "-Os")
+# No 16-byte function alignment either: the code runs from SRAM, where it buys nothing,
+# and the padding is space this image does not have (the M4 code area is 32 KiB).
+set(MODE_FLAGS "-Os -falign-functions=2")
 set(MODE_CPPSRC
 	proc_lora.cpp
 )
