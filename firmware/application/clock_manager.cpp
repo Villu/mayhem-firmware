@@ -830,7 +830,7 @@ void ClockManager::disable_if_clocks() {
  * VCO periods (0.3125 ns at 800 MHz; one 40 MHz period = 80). Set over USB with
  * write_memory (address from the map file); read back the counter to see it applied. */
 extern "C" {
-__attribute__((used)) volatile uint32_t g_tx_clk1_phase = 42;
+__attribute__((used)) volatile uint32_t g_tx_clk1_phase = 50;
 __attribute__((used)) volatile uint32_t g_tx_clk1_phase_applied = 0;
 /* TEST (freeze): non-zero = the first TX after setting it programs the Si5351 as usual,
  * after that neither TX nor RX touches the Si5351 (RX then runs on the TX clocks and
