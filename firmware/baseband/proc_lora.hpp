@@ -62,6 +62,13 @@ class LoRaRxChain {
         busy_mask_ = busy_mask ? busy_mask : &own_busy_;
     }
     void stop() { rx_active = false; }
+    // The processor gave this buffer's time to the other chain: the samples are gone, so
+    // whatever this chain was following (a preamble, a packet) is too. Start over.
+    void drop_buffer() {
+        if (!rx_active || !sf11_mode_) return;
+        sf11_job_active_ = false;
+        sf11_reset();
+    }
     // How many symbols the SFD search waits after the preamble locked. The lock comes six
     // symbols in, so this has to cover the rest of the longest preamble expected: 24 is
     // Meshtastic's 16 with room to spare, MeshCore's 32 at SF <= 8 needs more.
@@ -558,6 +565,14 @@ class LoRaProcessor : public BasebandProcessor {
     std::array<uint32_t, 1u << NCO_BITS> nco_lut_{};  // packed (cos | sin << 16)
     uint32_t nco_phase_{0};
     uint32_t nco_step_{0};
+    // Meshtastic first. A buffer lasts 1.024 ms = 208,896 M4 cycles, and one that
+    // overruns is not queued but lost - by both chains. The main chain takes ~70k cycles
+    // a buffer and the second one, with its frequency shift, ~105k; what is left does not
+    // cover the main chain's bursts while it locks on to and decodes a packet. So when the
+    // main chain has used more than this, the second one sits the buffer out (and drops
+    // whatever it was following) rather than make the main chain lose its packet.
+    static constexpr uint32_t MAIN_BUDGET_CYCLES{90000};
+    uint32_t aux_dropped_{0};  // buffers the second chain gave up (debug counter)
 
     /* NB: Threads must be the last members. */
     BasebandThread baseband_thread{baseband_fs, this, baseband::Direction::Receive};

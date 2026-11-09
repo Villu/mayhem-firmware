@@ -42,6 +42,35 @@
 #include "dsp_fir_taps.hpp"
 #include "audio_dma.hpp"  // RX-notification beep
 
+#include <hal.h>  // M4 SIMD intrinsics (shift_for_aux)
+
+#define LORA_PROF 0  // 1 = per-buffer cycle profile in g_lora_prof (read: tools/lora_prof.py)
+#if LORA_PROF
+// Every 1024 buffers: the average cycles of each part (the maxima are kept since the
+// baseband started; it restarts after every transmission). [0] magic 0x50524F46,
+// [1] windows published, then avg/max pairs for: main decim, main rest, shift, aux decim,
+// aux rest, whole execute(); [14] buffers the second chain gave to the first.
+struct LoRaProf {
+    uint32_t magic, windows;
+    uint32_t avg_max[6][2];
+    uint32_t aux_dropped;
+};
+volatile LoRaProf g_lora_prof __attribute__((used)) = {0x50524F46u, 0, {}};
+static uint32_t prof_sum[6], prof_max[6], prof_n;
+static uint32_t prof_dec_cycles;  // the decimation part of the chain call just made
+static inline uint32_t prof_now() {
+#if defined(__arm__)
+    return *reinterpret_cast<volatile uint32_t*>(0xE0001004u);
+#else
+    return 0;
+#endif
+}
+static inline void prof_add(int k, uint32_t c) {
+    prof_sum[k] += c;
+    if (c > prof_max[k]) prof_max[k] = c;
+}
+#endif
+
 #include <cmath>
 #include <algorithm>
 #include <complex>
@@ -1384,10 +1413,16 @@ bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off
 // SF11 streaming: decimate /8 -> 250 kHz, append to win11, run the state machine with a
 // per-call FFT budget (spread across the 8192-sample ~4 ms deadline).
 void LoRaRxChain::execute_sf11(const buffer_c8_t& buffer) {
+#if LORA_PROF
+    const uint32_t prof_t0 = prof_now();
+#endif
     // buffer_t has const members, so the second stage cannot be assigned over the first.
     const auto d8 = decim8_.execute(buffer, decim_buffer);
     const auto d4 = (bw125_ || bw62_) ? decim2_.execute(d8, decim_buffer2) : d8;
     const auto result = bw62_ ? decim2b_.execute(d4, decim_buffer3) : d4;
+#if LORA_PROF
+    prof_dec_cycles = prof_now() - prof_t0;
+#endif
 #if SF11_DEBUG
     static uint32_t dbg_calls = 0;
     static int dbg_out_peak = 0;
@@ -1952,6 +1987,11 @@ void LoRaRxChain::configure(uint8_t sf, uint32_t bw, uint8_t cr, uint32_t node_i
 // ===========================================================================
 
 LoRaProcessor::LoRaProcessor() {
+#if defined(__arm__)
+    // The cycle counter, for the Meshtastic-first budget in execute().
+    *reinterpret_cast<volatile uint32_t*>(0xE000EDFCu) |= (1u << 24);  // DEMCR.TRCENA
+    *reinterpret_cast<volatile uint32_t*>(0xE0001000u) |= 1u;          // DWT_CTRL.CYCCNTENA
+#endif
     main_.attach(ring_.data(), 0, LoRaRxChain::SF11_SPS * 4, LoRaRxChain::SF11_SPS * 8, LoRaRxChain::SF11_WIN);
     main_.set_identity(0, LoRaRxChain::Gate::Meshtastic, &busy_mask_);
     // Second chain, used only when both chains stream at SF <= 8 (a symbol of at most 256
@@ -1971,35 +2011,109 @@ LoRaProcessor::LoRaProcessor() {
     }
 }
 
+// The M4's cycle counter (DWT_CYCCNT, enabled in the constructor). The host harness has
+// none, and there the second chain simply never gives way.
+static inline uint32_t cycles_now() {
+#if defined(__arm__)
+    return *reinterpret_cast<volatile uint32_t*>(0xE0001004u);
+#else
+    return 0;
+#endif
+}
+
 void LoRaProcessor::execute(const buffer_c8_t& buffer) {
+    const uint32_t t0 = cycles_now();
+#if LORA_PROF
+    prof_dec_cycles = 0;
+#endif
     main_.execute(buffer);  // takes what it needs from the buffer first
+    const uint32_t t1 = cycles_now();
+#if LORA_PROF
+    prof_add(0, prof_dec_cycles);
+    prof_add(1, (t1 - t0) - prof_dec_cycles);
+#endif
     if (aux_on_) {
-        shift_for_aux(buffer);  // ...so the second chain can have it, shifted, in place
-        aux_.execute(buffer);
+        if (t1 - t0 > MAIN_BUDGET_CYCLES) {
+            // Meshtastic first (see MAIN_BUDGET_CYCLES). Keep the shift's phase running
+            // over the samples skipped, so the second chain restarts on a clean tone.
+            nco_phase_ += nco_step_ * static_cast<uint32_t>(buffer.count);
+            aux_.drop_buffer();
+            ++aux_dropped_;
+        } else {
+            shift_for_aux(buffer);  // ...so the second chain can have it, shifted, in place
+#if LORA_PROF
+            const uint32_t t2 = cycles_now();
+            prof_dec_cycles = 0;
+#endif
+            aux_.execute(buffer);
+#if LORA_PROF
+            const uint32_t t3 = cycles_now();
+            prof_add(2, t2 - t1);
+            prof_add(3, prof_dec_cycles);
+            prof_add(4, (t3 - t2) - prof_dec_cycles);
+#endif
+        }
     }
+#if LORA_PROF
+    prof_add(5, cycles_now() - t0);
+    if (++prof_n == 1024u) {
+        for (int k = 0; k < 6; ++k) {
+            g_lora_prof.avg_max[k][0] = prof_sum[k] / 1024u;
+            g_lora_prof.avg_max[k][1] = prof_max[k];  // sticky: the largest since start
+            prof_sum[k] = 0;
+        }
+        g_lora_prof.aux_dropped = aux_dropped_;
+        g_lora_prof.windows = g_lora_prof.windows + 1;
+        prof_n = 0;
+    }
+#endif
+}
+
+// (x >> 14) saturated to int8, in one instruction on the M4 (the compiler keeps the shift
+// and the saturation apart).
+static inline int32_t ssat8_asr14(int32_t x) {
+#if defined(__arm__)
+    int32_t r;
+    asm("ssat %0, #8, %1, asr #14" : "=r"(r) : "r"(x));
+    return r;
+#else
+    return __SSAT(x >> 14, 8);
+#endif
 }
 
 // x * exp(j*phase) on int8 I/Q, in place: I' = I*c - Q*s, Q' = I*s + Q*c. Full scale,
 // saturating: a weak signal keeps every bit it had, and only a sample already at the
 // ADC's limit can clip in the rotation.
+//
+// Two samples per word, on the M4's dual 16-bit multiply-accumulates (SMLSD for the real
+// part, SMLADX for the imaginary) with the rounding constant as the accumulator. The
+// plain loop took ~40 cycles a sample - 0.4 ms of every 1.024 ms buffer - which with the
+// second chain ran each buffer just past its deadline and dropped every other one.
 void LoRaProcessor::shift_for_aux(const buffer_c8_t& buffer) {
     uint32_t ph = nco_phase_;
     const uint32_t step = nco_step_;
     constexpr uint32_t SHIFT = 32 - NCO_BITS;
-    auto* const p = buffer.p;
-    for (size_t i = 0; i < buffer.count; ++i) {
-        const int32_t xi = p[i].real(), xq = p[i].imag();
-        const uint32_t lo = nco_lut_[ph >> SHIFT];
+    const uint32_t* const lut = nco_lut_.data();
+    auto* const w = reinterpret_cast<uint32_t*>(buffer.p);  // [I0 Q0 I1 Q1] per word
+    const size_t words = buffer.count / 2;
+    for (size_t k = 0; k < words; ++k) {
+        const uint32_t v = w[k];
+        const uint32_t i1i0 = __SXTB16(v, 0);
+        const uint32_t q1q0 = __SXTB16(v, 8);
+        const uint32_t x0 = __PKHBT(i1i0, q1q0, 16);  // Q0:I0
+        const uint32_t x1 = __PKHTB(q1q0, i1i0, 16);  // Q1:I1
+        const uint32_t l0 = lut[ph >> SHIFT];          // sin:cos
         ph += step;
-        const int32_t c = static_cast<int16_t>(lo & 0xFFFF);
-        const int32_t sn = static_cast<int16_t>(lo >> 16);
-        int32_t yi = (xi * c - xq * sn + 8192) >> 14;
-        int32_t yq = (xi * sn + xq * c + 8192) >> 14;
-        if (yi > 127) yi = 127;
-        if (yi < -127) yi = -127;
-        if (yq > 127) yq = 127;
-        if (yq < -127) yq = -127;
-        p[i] = complex8_t{static_cast<int8_t>(yi), static_cast<int8_t>(yq)};
+        const uint32_t l1 = lut[ph >> SHIFT];
+        ph += step;
+        // Signed: CMSIS returns these as uint32_t, and a logical shift would turn every
+        // negative product into a large positive one.
+        const int32_t yi0 = ssat8_asr14(static_cast<int32_t>(__SMLSD(x0, l0, 8192)));
+        const int32_t yq0 = ssat8_asr14(static_cast<int32_t>(__SMLADX(x0, l0, 8192)));
+        const int32_t yi1 = ssat8_asr14(static_cast<int32_t>(__SMLSD(x1, l1, 8192)));
+        const int32_t yq1 = ssat8_asr14(static_cast<int32_t>(__SMLADX(x1, l1, 8192)));
+        w[k] = __PKHBT((static_cast<uint32_t>(yi0) & 0xFFu) | (static_cast<uint32_t>(yq0) << 8),
+                       (static_cast<uint32_t>(yi1) & 0xFFu) | (static_cast<uint32_t>(yq1) << 8), 16);
     }
     nco_phase_ = ph;
 }

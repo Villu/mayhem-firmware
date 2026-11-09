@@ -4757,8 +4757,8 @@ void MeshCorePageView::refresh() {
                                                  : static_cast<uint32_t>(channel_frequency(cfg_.region_idx, cfg_.preset_idx, cfg_.freq_slot, cfg_.primary_name.c_str()));
     const int64_t off = static_cast<int64_t>(hz) - static_cast<int64_t>(mt_hz);
     if (!cfg_.mc.enabled) {
-        text_note0_.set("Off. Chat: Ch > MeshCore Public");
-        text_note1_.set("once it is on.");
+        text_note0_.set("Off.");
+        text_note1_.set("Chat: Ch > MeshCore Public");
     } else if (mt.sf > 8 || p.sf > 8 || p.sf < 7) {
         text_note0_.set("Send only: hearing both needs");
         text_note1_.set("SF7/8 on both (NARROW presets)");
