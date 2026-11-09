@@ -832,6 +832,10 @@ void ClockManager::disable_if_clocks() {
 extern "C" {
 __attribute__((used)) volatile uint32_t g_tx_clk1_phase = 42;
 __attribute__((used)) volatile uint32_t g_tx_clk1_phase_applied = 0;
+/* TEST (freeze): non-zero = the first TX after setting it programs the Si5351 as usual,
+ * after that neither TX nor RX touches the Si5351 (RX then runs on the TX clocks and
+ * is broken; only for TX tests). Write 0 and back to 1 for a fresh setup. */
+__attribute__((used)) volatile uint32_t g_tx_clk_freeze = 0;
 }
 
 void ClockManager::set_sampling_frequency(const uint32_t frequency) {
@@ -879,9 +883,20 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
 
     radio::invalidate_spi_config();
 
+    static bool s_clk_frozen = false;
+    bool skip_si5351 = false;
+    if (g_tx_clk_freeze) {
+        if (s_clk_frozen)
+            skip_si5351 = true;
+        else if (radio::debug::get_cached_direction() == rf::Direction::Transmit)
+            s_clk_frozen = true;
+    } else {
+        s_clk_frozen = false;
+    }
+
     // Configure Si5351 clocks using the correct AFE VCO
     // CLK0 always drives the AFE/MAX5864 clock.
-    clock_generator.set_ms_frequency(0, afe_rate * 2, si5351_vco_afe_f, 1);
+    if (!skip_si5351) clock_generator.set_ms_frequency(0, afe_rate * 2, si5351_vco_afe_f, 1);
 
     /* Do not reset PLLA here. On PRALINE, CLK2/MCU_CLKIN is sourced from PLLA,
      * so a runtime PLLA reset can glitch the LPC43xx peripheral clock tree and
@@ -913,7 +928,7 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
         }
 
         // TX gateware consumes complex samples at the rate presented on CLK1.
-        if (_datapath_pll_a) {
+        if (_datapath_pll_a && !skip_si5351) {
             /* As the reference (clock_gen.c sample_rate_set, PRALINE): CLK1 gets exactly
              * CLK0's settings, 2x the AFE rate through the /2 output divider, so the two
              * dividers restart in step at the PLL A reset below. FPGA_CLK is then delayed
@@ -932,7 +947,7 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
             (void)phase_offset;
             clock_generator.write_register(166, static_cast<uint8_t>(g_tx_clk1_phase & 0x7f));
             g_tx_clk1_phase_applied++;
-        } else {
+        } else if (!skip_si5351) {
             clock_generator.set_ms_frequency(1, afe_rate, si5351_vco_afe_f, 0);
         }
 
@@ -949,8 +964,8 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
     // for RX mode
     else {
         // RX path keeps CLK1 at 2x AFE for receive timing / SGPIO alignment.
-        clock_generator.set_ms_frequency(1, afe_rate * 2, si5351_vco_afe_f, 0);
-        if (_datapath_pll_a) {
+        if (!skip_si5351) clock_generator.set_ms_frequency(1, afe_rate * 2, si5351_vco_afe_f, 0);
+        if (_datapath_pll_a && !skip_si5351) {
             clock_generator.write_register(166, 0);  // no CLK1 phase offset in RX (as before)
         }
 
@@ -987,7 +1002,7 @@ void ClockManager::set_sampling_frequency(const uint32_t frequency) {
         fpga_debug_register_write(1, 0x01);
     }
 
-    if (_datapath_pll_a) {
+    if (_datapath_pll_a && !skip_si5351) {
         // Restart CLK0 and CLK1 in step (see init_clock_generator), wait for the lock.
         clock_generator.reset_pll_a();
         uint32_t pll_timeout = 100000;
