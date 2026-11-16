@@ -4926,9 +4926,14 @@ MeshCorePageView::MeshCorePageView(NavigationView& nav, MeshSettings& cfg, MeshS
     : MeshSettingsPage(nav, cfg, hooks) {
     add_children({&labels_, &check_enabled_, &field_preset_, &button_freq_, &field_sf_, &field_bw_,
                   &field_cr_, &button_name_, &button_ch_, &button_key_, &text_note0_, &text_note1_,
-                  &disclaimer_, &button_advert_});
+                  &disclaimer_, &button_advert_, &field_advert_});
     button_advert_.on_select = [this](Button&) {
         if (hooks_.mc_advert) hooks_.mc_advert();
+    };
+    field_advert_.set_by_value(cfg_.mc.advert_h);
+    field_advert_.on_change = [this](size_t, OptionsField::value_t v) {
+        cfg_.mc.advert_h = static_cast<uint8_t>(v);
+        changed();
     };
     check_enabled_.set_value(cfg_.mc.enabled);
     check_enabled_.on_select = [this](Checkbox&, bool v) {
@@ -5777,6 +5782,7 @@ const SettingDef SETTING_DEFS[] = {
     {"mc_ch"sv, offsetof(MeshSettings, mc.ch_name), K::STR},
     {"mc_key"sv, offsetof(MeshSettings, mc.ch_key), K::STR},
     {"mc_prv"sv, offsetof(MeshSettings, mc.prv_hex), K::STR},
+    {"mc_adv"sv, offsetof(MeshSettings, mc.advert_h), K::U8},
 };
 }  // namespace
 
@@ -6282,7 +6288,7 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     // it adds us to a phone together with our public key, which is what lets that phone
     // send us an encrypted direct message without anyone typing anything.
     hooks_.send_telemetry = [this]() { broadcast_telemetry(); };
-    hooks_.mc_advert = [this]() { mc_send_advert(true); };
+    hooks_.mc_advert = [this]() { mc_send_advert(); };
     hooks_.share_me = [this]() {
         share_url_ = meshtastic::contact_share_url(cfg_.node_id, cfg_.node_long_name,
                                                    cfg_.node_short_name, pki_pub_,
@@ -6333,6 +6339,7 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     // are still settling from run_image - can wedge the M0 on an app restart.
     // Seed the timer so the first NODEINFO fires ~5 s in via on_timer instead.
     nodeinfo_timer_ = nodeinfo_period() - 300;
+    mc_advert_timer_ = mc_advert_period() - MC_ADVERT_FIRST;  // the first advert ~20 s in
     // First telemetry ~8 s in - after the nodeinfo; own_bcast_due() then holds it until
     // OWN_BCAST_GAP has passed, so it actually leaves ~20 s in. Seed relative to the period.
     const uint32_t telp0 = cfg_.telemetry.tel_min * 3600u;
@@ -6717,7 +6724,15 @@ bool MeshtasticView::mc_ensure_identity() {
     return true;
 }
 
-void MeshtasticView::mc_send_advert(bool by_user) {
+// Whether our advert should go out now by itself. Like the Meshtastic broadcasts it
+// keeps its distance from our other transmissions (own_bcast_due).
+bool MeshtasticView::mc_advert_due() {
+    if (!cfg_.mc.enabled || !cfg_.mc.advert_h || cfg_.radio_mode == 2) return false;
+    if (!rtc_is_set() && uptime_ticks_ < MC_ADVERT_CLOCK_WAIT) return false;
+    return own_bcast_due(mc_advert_timer_, mc_advert_period());
+}
+
+void MeshtasticView::mc_send_advert(bool before_dm) {
     if (!cfg_.mc.enabled) {
         chat_view_.write_console("* MeshCore is off: Setup > MeshCore\n");
         return;
@@ -6736,7 +6751,8 @@ void MeshtasticView::mc_send_advert(bool by_user) {
         return;
     }
     mc_advert_sent_ = true;
-    chat_view_.write_console(std::string(by_user ? "* MeshCore advert sent, key " : "* sent our MeshCore advert first, key ") +
+    mc_advert_timer_ = 0;  // the next one by itself is a full interval away
+    chat_view_.write_console(std::string(before_dm ? "* sent our MeshCore advert first, key " : "* MeshCore advert sent, key ") +
                              to_string_hex(meshcore::NodeList::key4(mc_pub_), 8) + "\n");
 }
 
@@ -6804,7 +6820,7 @@ uint32_t MeshtasticView::send_meshcore_dm(const std::string& text) {
     if (!mc_ensure_identity()) return 0;
     // The recipient can only answer (and only read us) once it holds our key, and the
     // advert is where it gets it. Once a session, before the first message.
-    if (!mc_advert_sent_) mc_send_advert(false);
+    if (!mc_advert_sent_) mc_send_advert(true);
     const uint8_t* const secret = mc_secret_for(*e);
     if (!secret) {
         chat_view_.write_console("* MeshCore: unusable key for that node\n");
@@ -7455,6 +7471,8 @@ void MeshtasticView::on_timer() {
                               !cfg_.listen_only;
     if (role_announces && cfg_.nodeinfo_min && own_bcast_due(nodeinfo_timer_, nodeinfo_period()))
         broadcast_nodeinfo();
+    // The same on the other network: our MeshCore advert.
+    if (role_announces && mc_advert_due()) mc_send_advert();
 
     // Neighbour list: sparse on purpose, six hours by default.
     if (role_reports && cfg_.nbr_min && own_bcast_due(nbr_timer_, cfg_.nbr_min * 3600u))
