@@ -2532,6 +2532,15 @@ bool RadioModeText::on_key(const KeyEvent key) {
     return false;
 }
 
+// One tap, one step. Text acts on the touch's Start, and the dispatcher hands a widget
+// its Start twice (once to find who takes the touch, once more as the widget that took
+// it), so a tap stepped the mode twice: from both ways straight to receive only, and
+// then two more taps to get back. The End arrives once.
+bool RadioModeText::on_touch(const TouchEvent event) {
+    if (event.type == TouchEvent::Type::End && on_select) on_select(*this);
+    return true;
+}
+
 void MeshtasticChatView::init_radio_mode_switch() {
     // Focusable, so the D-pad can reach it. It was touch-only, which on a device with
     // a perfectly good navigation cross is half a control.
