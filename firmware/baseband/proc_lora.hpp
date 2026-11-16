@@ -549,6 +549,13 @@ class LoRaRxChain {
     uint8_t srch_best_bad_{0xFF};
     int8_t srch_best_hs_{-1};
     uint32_t srch_best_off_{0};
+    // Erasures (MeshCore at CR 4/8): payload symbols whose peak came out far less distinct
+    // than this packet's usual ones, marked by position in the current block. Symbol i of
+    // a block carries bit i of every code word, so each mark is one known-unreliable bit
+    // position, and a code word that fails its parity is rebuilt from the other bits.
+    uint8_t erase_mask_{0};
+    float sharp_ref_{0.0f};  // the packet's running payload sharpness
+    static constexpr float ERASE_SHARP_FRACTION{0.35f};
 };
 
 // The LoRa receive baseband: one chain for the application's main network, and an

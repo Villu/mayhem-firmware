@@ -235,6 +235,14 @@ void LoRaRxChain::check_payload_crc(size_t len) {
     crc_state_ = (have == want) ? LoRaPacketMessage::CRC_OK : LoRaPacketMessage::CRC_BAD;
 }
 
+// True when an 8-bit Hamming code word passes all four of its parity checks (the same
+// checks hamming_correct84 makes).
+static inline bool cw84_valid(uint8_t cw) {
+    const int d0 = (cw >> 4) & 1, d1 = (cw >> 5) & 1, d2 = (cw >> 6) & 1, d3 = (cw >> 7) & 1;
+    return (((cw >> 3) & 1) == (d3 ^ d2 ^ d1)) && (((cw >> 2) & 1) == (d2 ^ d1 ^ d0)) &&
+           (((cw >> 1) & 1) == (d3 ^ d2 ^ d0)) && ((cw & 1) == (d3 ^ d1 ^ d0));
+}
+
 void LoRaRxChain::process_sym_block() {
     // Number of codewords per block: SF-2 with LDRO (SF>=11), SF without.
     const int cpb = use_ldro_ ? (static_cast<int>(spreading_factor) - 2)
@@ -253,8 +261,47 @@ void LoRaRxChain::process_sym_block() {
     // (2026-11-16). The shorter codes cannot correct safely (see hamming_top4), and the
     // Meshtastic chain keeps its proven path.
     const bool correct = (gate_ != Gate::Meshtastic && cr == 8);
-    for (int i = 0; i < cpb; i++)
-        feed_nibble(correct ? lora::hamming_correct84(static_cast<uint8_t>(cw[i])) : lora::hamming_top4(cw[i], cr));
+    // Erased positions: symbol i of the block is bit (7 - i) of every code word. A short
+    // strong burst (here: a neighbour's 14 ms FSK telegrams on 869.525 MHz, which the
+    // HackRF's phase noise smears over the whole band) buries a few consecutive symbols
+    // of one block; their bits come out wrong in every code word, too many for the
+    // single-error correction. Distance four lets up to three known-unreliable bits be
+    // rebuilt (the one filling that makes the word valid), and four as long as exactly
+    // one filling works - true for every run of four consecutive symbols, which is what a
+    // burst leaves, and for 56 of the 70 four-position patterns. A word that is valid as
+    // received is left alone, so a symbol marked by mistake costs nothing; with more
+    // marks, or no single valid filling, the single-error correction runs as before.
+    uint8_t emask = 0;
+    int nerased = 0;
+    if (correct) {
+        for (int i = 0; i < 8; i++)
+            if (erase_mask_ & (1u << i)) {
+                emask = static_cast<uint8_t>(emask | (1u << (7 - i)));
+                ++nerased;
+            }
+    }
+    erase_mask_ = 0;
+    for (int i = 0; i < cpb; i++) {
+        if (!correct) {
+            feed_nibble(lora::hamming_top4(cw[i], cr));
+            continue;
+        }
+        uint8_t w = static_cast<uint8_t>(cw[i]);
+        if (nerased > 0 && nerased <= 4 && !cw84_valid(w)) {
+            int found = 0;
+            uint8_t fixed = w;
+            for (uint8_t f = 0;; f = static_cast<uint8_t>((f - emask) & emask)) {  // every subset of emask
+                const uint8_t c = static_cast<uint8_t>((w & ~emask) | f);
+                if (cw84_valid(c)) {
+                    fixed = c;
+                    ++found;
+                }
+                if (f == emask) break;
+            }
+            if (found == 1) w = fixed;
+        }
+        feed_nibble(lora::hamming_correct84(w));
+    }
 }
 
 // --- Main symbol window processor -------------------------------------------
@@ -1445,6 +1492,8 @@ bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off
     const uint8_t len = decode_header();  // sets header_valid_ + hdr_extra_*
     if (!header_valid_ || len < 4 || len > MAX_PAYLOAD) return false;
     payload_len_target_ = len;
+    erase_mask_ = 0;
+    sharp_ref_ = (sf11_res_bestsh_ > 0.0f) ? sf11_res_bestsh_ : 0.0f;
     sym_in_block_ = 0;
     payload_sym_count_ = 0;
     nibble_lo_valid_ = false;
@@ -1896,6 +1945,14 @@ void LoRaRxChain::sf11_consume() {
         // otherwise - and folding the residual into the group decision was the last one
         // left. If the boundary survives this, the fault is older than anything I added.
         if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
+        // MeshCore at CR 4/8: a symbol far less distinct than the packet's own run of them
+        // is marked as an erasure (see process_sym_block); the others keep the reference.
+        if (gate_ != Gate::Meshtastic && rx_cw_len_ == 8) {
+            if (sharp_ref_ > 0.0f && sh < sharp_ref_ * ERASE_SHARP_FRACTION)
+                erase_mask_ = static_cast<uint8_t>(erase_mask_ | (1u << sym_in_block_));
+            else
+                sharp_ref_ = (sharp_ref_ > 0.0f) ? sharp_ref_ + (sh - sharp_ref_) * 0.125f : sh;
+        }
         // A tracking loop used to sit here and it was wrong in its premise. The residual
         // is where the peak sits INSIDE its bin, not evidence that the peak is moving:
         // a signal parked at b+0.3 hands over +0.3 every symbol, and integrating that
