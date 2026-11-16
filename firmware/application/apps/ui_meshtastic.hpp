@@ -452,6 +452,10 @@ struct MeshCoreSettings {
     // Our MeshCore identity for direct messages: the 64-byte Ed25519 private key as
     // MeshCore exports it (128 hex digits). Made the first time it is needed.
     std::string prv_hex{};
+    // Our advert goes out by itself shortly after the start and then every this many
+    // hours (0 = only when asked for). A MeshCore node lists others from their adverts
+    // alone, so without it nobody sees us until we press the button.
+    uint8_t advert_h{3};
 };
 
 // ---- Everything this app remembers -----------------------------------------
@@ -1946,7 +1950,8 @@ class MeshCorePageView : public MeshSettingsPage {
         {{16 * 8, S3}, "CR4/", Theme::getInstance()->fg_light->foreground},
         {{0, S4}, "Name:", Theme::getInstance()->fg_light->foreground},
         {{0, S5}, "Ch 2:", Theme::getInstance()->fg_light->foreground},
-        {{0, S6}, "Key:", Theme::getInstance()->fg_light->foreground}};
+        {{0, S6}, "Key:", Theme::getInstance()->fg_light->foreground},
+        {{13 * 8, S7 + 86}, "and every", Theme::getInstance()->fg_light->foreground}};
     Checkbox check_enabled_{{0, S0}, 4, "MeshCore network on", true};
     OptionsField field_preset_{{8 * 8, S1}, 14, {}};
     Button button_freq_{{6 * 8, S2, 15 * 8, 16}, ""};
@@ -1965,8 +1970,10 @@ class MeshCorePageView : public MeshSettingsPage {
     Labels disclaimer_{
         {{0, S7 + 40}, "MeshCore is a separate network.", Theme::getInstance()->fg_dark->foreground},
         {{0, S7 + 56}, "Not affiliated with MeshCore.", Theme::getInstance()->fg_dark->foreground}};
-    // Our advert carries the key a MeshCore node needs before it can write to us.
-    Button button_advert_{{0, S7 + 80, screen_width, 28}, "Send advert now"};
+    // Our advert is what puts us on other nodes' lists, and it carries the key a node
+    // needs before it can write to us: now, and by itself every so often.
+    Button button_advert_{{0, S7 + 80, 12 * 8, 28}, "Advert now"};
+    OptionsField field_advert_{{23 * 8, S7 + 86}, 4, {{"Off", 0}, {"1 h", 1}, {"3 h", 3}, {"6 h", 6}, {"12 h", 12}, {"24 h", 24}}};
     bool refreshing_{false};  // refresh() setting the fields is not the user changing them
     void to_custom();         // a modem field changed: carry the preset over into Custom
     void refresh();
@@ -2419,7 +2426,18 @@ class MeshtasticView : public View {
     bool mc_load_identity();      // from the settings; false = none saved
     bool mc_ensure_identity();    // load, or make and save one
     bool mc_advert_sent_{false};  // this session: a peer needs it before it can answer
-    void mc_send_advert(bool by_user);
+    void mc_send_advert(bool before_dm = false);
+    // The advert sent unprompted: MeshCoreSettings::advert_h. Counted in timer ticks
+    // (~60 Hz) since the last advert of any kind; seeded so the first falls due
+    // MC_ADVERT_FIRST after the start.
+    static constexpr uint32_t MC_ADVERT_FIRST = 20 * 60;
+    // With no clock an advert is stamped 0, and a node that already holds a newer one of
+    // ours ignores it. So the first waits for the clock (a Meshtastic peer's time sets
+    // it), but no longer than this.
+    static constexpr uint32_t MC_ADVERT_CLOCK_WAIT = 10 * 60 * 60;
+    uint32_t mc_advert_timer_{0};
+    uint32_t mc_advert_period() const { return cfg_.mc.advert_h * 3600u * 60u; }
+    bool mc_advert_due();
 
     // Direct messages.
     uint32_t mc_dm_peer_{0};  // key4 of the open thread, 0 = none

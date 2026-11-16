@@ -196,8 +196,11 @@ Meshtastic (the `mc_` keys in the settings file). Not affiliated with MeshCore.
   tab, under their own heading.
 - **Direct messages** with companions (people's nodes): `Message (encrypted)` on the
   node's page. The delivery dot, the retries and the Chats list work as they do for a
-  Meshtastic private message. The other side needs your advert before it can answer; it
-  goes out before your first message, or from `Send advert now` on the MeshCore page.
+  Meshtastic private message. The other side needs your advert before it can answer.
+- **Adverts.** A MeshCore node lists others from their adverts alone. Ours goes out by
+  itself about 20 seconds after the app starts and then every 3 hours (`and every` on
+  the MeshCore page: Off, or 1 to 24 hours), from `Advert now`, and before the first
+  direct message of a session. Nothing is sent in receive-only mode or with Listen only.
 
 Hearing both networks at once takes a second demodulator on the same capture. That fits
 only when both use SF7 or SF8 at 250 kHz or narrower, and the MeshCore channel lies
