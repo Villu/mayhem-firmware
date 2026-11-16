@@ -90,6 +90,8 @@ void set_btletx(uint8_t channel_number, char* macAddress, char* advertisementDat
 
 // LoRa / Meshtastic
 void set_lora_config(uint8_t spreading_factor, uint32_t bandwidth_hz, uint8_t coding_rate, uint32_t local_node_id = 0);
+// The full set: transmit sync word / preamble, and a second receive chain (MeshCore).
+void set_lora_config(LoRaConfigureMessage message);
 void send_lora_packet(const uint8_t* data, size_t len);
 
 void set_nrf(const uint32_t baudrate, const uint32_t word_length, const uint32_t trigger_value, const bool trigger_word);

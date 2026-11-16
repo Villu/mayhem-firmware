@@ -61,7 +61,7 @@ void LoRaTXProcessor::push_sym(uint16_t chip, bool up, bool quarter) {
         frame_[frame_len_++] = {chip, up, quarter};
 }
 
-// Frame = preamble(16) + sync 0x2B(2) + 2.25 downchirp SFD + header(8) + payload.
+// Frame = preamble + sync word (2) + 2.25 downchirp SFD + header(8) + payload.
 // The PHY CRC-16 is appended here; whitening is applied to the payload only.
 void LoRaTXProcessor::build_frame(const uint8_t* payload, size_t payload_len) {
     frame_len_ = 0;
@@ -72,15 +72,15 @@ void LoRaTXProcessor::build_frame(const uint8_t* payload, size_t payload_len) {
     const int cw_len = static_cast<int>(coding_rate);       // 5 for CR4/5
     const int len = static_cast<int>(payload_len);
 
-    // 1. preamble (16 upchirps at chip 0)
-    for (int i = 0; i < 16; i++) push_sym(0, true);
-    // 2. sync word 0x2B -> the two network-id upchirps sit at FIXED raw symbol
-    //    values nibble*8 (16 and 88), the same at every SF - NOT nibble<<(SF-4).
+    // 1. preamble (upchirps at chip 0; Meshtastic 16, MeshCore 32 at SF <= 8)
+    for (int i = 0; i < preamble_len_; i++) push_sym(0, true);
+    // 2. sync word -> the two network-id upchirps sit at FIXED raw symbol
+    //    values nibble*8 (0x2B: 16 and 88), the same at every SF - NOT nibble<<(SF-4).
     //    The old SF-scaled form gave 16/88 at SF7 (so ShortTurbo TX worked) but
     //    256/1408 at SF11, so a hardware SX126x (Heltec) rejected our LongFast
     //    packets on the sync-word check -> TX "didn't work" on every non-SF7 preset.
-    push_sym(static_cast<uint16_t>(0x2u << 3), true);  // 16
-    push_sym(static_cast<uint16_t>(0xBu << 3), true);  // 88
+    push_sym(static_cast<uint16_t>((sync_word_ >> 4) << 3), true);
+    push_sym(static_cast<uint16_t>((sync_word_ & 0x0F) << 3), true);
     // 3. SFD: 2.25 downchirps (2 full + one quarter-length)
     push_sym(0, false);
     push_sym(0, false);
@@ -222,6 +222,8 @@ void LoRaTXProcessor::configure(const LoRaConfigureMessage& msg) {
     spreading_factor = msg.spreading_factor;
     bandwidth = msg.bandwidth;
     coding_rate = msg.coding_rate;
+    sync_word_ = msg.sync_word;
+    preamble_len_ = (msg.preamble_len >= 6 && msg.preamble_len <= 64) ? msg.preamble_len : 16;
     chips_per_symbol = 1u << spreading_factor;
     use_ldro_ = lora::ldro_needed(spreading_factor, bandwidth);
 

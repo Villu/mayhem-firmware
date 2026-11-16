@@ -42,9 +42,30 @@
 #include "dsp_fir_taps.hpp"
 #include "audio_dma.hpp"  // RX-notification beep
 
+#include <hal.h>  // M4 SIMD intrinsics (shift_for_aux)
+
 #include <cmath>
 #include <algorithm>
 #include <complex>
+
+// The M4's cycle counter (DWT_CYCCNT, switched on in LoRaProcessor's constructor). A
+// buffer of 2048 samples is due every 208,896 cycles (2 MS/s, 204 MHz) and one that
+// overruns is not queued but lost, so the two receive chains budget their work by it.
+// Off the target (a build of this file for the PC) there is no counter: it reads 0 and
+// nothing ever waits or gives way.
+static inline uint32_t cycles_now() {
+#if defined(__arm__)
+    return *reinterpret_cast<volatile uint32_t*>(0xE0001004u);
+#else
+    return 0;
+#endif
+}
+// When the buffer now being processed arrived.
+static uint32_t g_buf_t0 = 0;
+// MeshCore's header search can wait, so a slice of it starts no new candidate this far
+// into a buffer: one candidate is a few thousand cycles and little else runs after the
+// search in the same buffer.
+static constexpr uint32_t SEARCH_DEADLINE_CYCLES = 150000u;
 
 // --- Standalone radix-2 in-place FFT (no dsp_fft.hpp size limit) -------------
 // n must be a power of two. Operates on complex<float> array of exactly n elements.
@@ -91,11 +112,11 @@ static void lora_fft_inplace(std::complex<float>* data, size_t n) {
 
 // --- Helpers ----------------------------------------------------------------
 
-uint8_t LoRaProcessor::lora_whiten_step() {
+uint8_t LoRaRxChain::lora_whiten_step() {
     return lora::whiten_next(whiten_state_);
 }
 
-void LoRaProcessor::reset_rx() {
+void LoRaRxChain::reset_rx() {
     rx_state_ = RxState::HUNT;
     preamble_run_ = 0;
     new_pre_run_ = 0;
@@ -138,7 +159,7 @@ void LoRaProcessor::reset_rx() {
 
 // Assemble a payload nibble into a byte (low nibble first, LoRa order) and, once a
 // byte is complete, de-whiten it (LFSR, matches TX) and append to payload_buf.
-void LoRaProcessor::feed_nibble(uint8_t nibble) {
+void LoRaRxChain::feed_nibble(uint8_t nibble) {
     if (!nibble_lo_valid_) {
         nibble_lo_ = nibble;
         nibble_lo_valid_ = true;
@@ -161,7 +182,7 @@ void LoRaProcessor::feed_nibble(uint8_t nibble) {
 // never more than the header said the payload would be. Anything past that point is
 // the CRC, which is not payload - handing it up would reach the decoder as a trailing
 // junk byte. If the CRC did arrive after all, it is checked here too.
-void LoRaProcessor::send_truncated(size_t min_len) {
+void LoRaRxChain::send_truncated(size_t min_len) {
     size_t n = decoded_len_;
     if (payload_len_target_ && n > payload_len_target_) n = payload_len_target_;
     if (n < min_len) return;
@@ -172,7 +193,7 @@ void LoRaProcessor::send_truncated(size_t min_len) {
 // True once the payload and, when the header declares one, its two CRC bytes have
 // been assembled. The receiver used to stop at the declared length and step over the
 // CRC without reading it, which is why no frame was ever checked.
-bool LoRaProcessor::payload_complete() const {
+bool LoRaRxChain::payload_complete() const {
     size_t need = static_cast<size_t>(payload_len_target_) + (hdr_has_crc_ ? 2u : 0u);
     if (need > MAX_PAYLOAD) need = MAX_PAYLOAD;
     return decoded_len_ >= need;
@@ -180,7 +201,7 @@ bool LoRaProcessor::payload_complete() const {
 
 // Compare the trailing bytes against the CRC of the payload. Both sit in payload_buf:
 // the payload de-whitened, the CRC as received, low byte first.
-void LoRaProcessor::check_payload_crc(size_t len) {
+void LoRaRxChain::check_payload_crc(size_t len) {
     crc_state_ = LoRaPacketMessage::CRC_UNCHECKED;
     if (!hdr_has_crc_ || len < 1) return;
     if (static_cast<size_t>(decoded_len_) < len + 2) return;  // trailing bytes never arrived
@@ -190,7 +211,32 @@ void LoRaProcessor::check_payload_crc(size_t len) {
     crc_state_ = (have == want) ? LoRaPacketMessage::CRC_OK : LoRaPacketMessage::CRC_BAD;
 }
 
-void LoRaProcessor::process_sym_block() {
+// True when an 8-bit Hamming code word passes all four of its parity checks (the same
+// checks hamming_correct84 makes).
+static inline bool cw84_valid(uint8_t cw) {
+    const int d0 = (cw >> 4) & 1, d1 = (cw >> 5) & 1, d2 = (cw >> 6) & 1, d3 = (cw >> 7) & 1;
+    return (((cw >> 3) & 1) == (d3 ^ d2 ^ d1)) && (((cw >> 2) & 1) == (d2 ^ d1 ^ d0)) &&
+           (((cw >> 1) & 1) == (d3 ^ d2 ^ d0)) && ((cw & 1) == (d3 ^ d1 ^ d0));
+}
+
+// A CR 4/8 code word whose bits under `emask` are known to be unreliable: when exactly
+// one way of filling those bits gives a valid word, that is the word. Otherwise it comes
+// back as received.
+static uint8_t fill_erasures(uint8_t w, uint8_t emask) {
+    int found = 0;
+    uint8_t fixed = w;
+    for (uint8_t f = 0;; f = static_cast<uint8_t>((f - emask) & emask)) {  // every subset of emask
+        const uint8_t c = static_cast<uint8_t>((w & ~emask) | f);
+        if (cw84_valid(c)) {
+            fixed = c;
+            ++found;
+        }
+        if (f == emask) break;
+    }
+    return (found == 1) ? fixed : w;
+}
+
+void LoRaRxChain::process_sym_block() {
     // Number of codewords per block: SF-2 with LDRO (SF>=11), SF without.
     const int cpb = use_ldro_ ? (static_cast<int>(spreading_factor) - 2)
                               : static_cast<int>(spreading_factor);
@@ -198,7 +244,42 @@ void LoRaProcessor::process_sym_block() {
 
     uint16_t cw[12] = {};
     lora::deinterleave(sym_block_.data(), cpb, cr, cw);
-    for (int i = 0; i < cpb; i++) feed_nibble(lora::hamming_top4(cw[i], cr));
+    const uint8_t erased = erase_mask_;
+    erase_mask_ = 0;
+    if (gate_ == Gate::Meshtastic || cr != 8) {
+        // No correction: the shorter codes cannot correct safely (see hamming_top4), and
+        // the Meshtastic chain keeps its proven path.
+        for (int i = 0; i < cpb; i++) feed_nibble(lora::hamming_top4(cw[i], cr));
+        return;
+    }
+    // MeshCore sends CR 4/8, and there the parity is worth using. The code's distance is
+    // four, and hamming_correct84 flips a data bit only on one of the four weight-3
+    // syndromes, which two errors can never produce (theirs have even weight). So a
+    // single wrong bit per code word - what one wrong symbol leaves in a block - is put
+    // right, and a double one is left as it came. Without this a MeshCore packet failed
+    // its CRC on any one off-by-one symbol.
+    //
+    // Erasures go further. A short strong burst nearby buries a few consecutive symbols
+    // of one block; symbol i of the block is bit (7 - i) of every code word, so those bits
+    // come out wrong in every word, too many for the single-error correction. Distance
+    // four lets up to three known-unreliable bits be rebuilt, and four as long as exactly
+    // one filling is valid - true for every run of four consecutive symbols, which is
+    // what a burst leaves. A word that is valid as received is left alone, so a symbol
+    // marked by mistake costs nothing; with more marks, or no single valid filling, the
+    // single-error correction runs as before.
+    uint8_t emask = 0;
+    int nerased = 0;
+    for (int i = 0; i < 8; i++) {
+        if (erased & (1u << i)) {
+            emask = static_cast<uint8_t>(emask | (1u << (7 - i)));
+            ++nerased;
+        }
+    }
+    for (int i = 0; i < cpb; i++) {
+        uint8_t w = static_cast<uint8_t>(cw[i]);
+        if (nerased >= 1 && nerased <= 4 && !cw84_valid(w)) w = fill_erasures(w, emask);
+        feed_nibble(lora::hamming_correct84(w));
+    }
 }
 
 // --- Main symbol window processor -------------------------------------------
@@ -233,7 +314,7 @@ void LoRaProcessor::process_sym_block() {
 // Decode the reduced-rate explicit-header block (8 symbols in hdr_sym_) ->
 // packet length. gr-lora dims: deinterleave sf_app=SF-2, cw_len=8; nibble =
 // bit-reversed top4 of the codeword; length = (nib0<<4)|nib1.
-uint8_t LoRaProcessor::decode_header() {
+uint8_t LoRaRxChain::decode_header() {
     const int sf_app = static_cast<int>(spreading_factor) - 2;  // 5 for SF7
     const int cw_len = 8;
     uint8_t cw[12] = {};
@@ -270,7 +351,7 @@ uint8_t LoRaProcessor::decode_header() {
     return static_cast<uint8_t>((nib[0] << 4) | nib[1]);  // raw length byte (caller checks header_valid_)
 }
 
-void LoRaProcessor::process_one_symbol() {
+void LoRaRxChain::process_one_symbol() {
     // Apply any pending one-shot sample skip (phase scan / SFD realign).
     if (skip_samples_) {
         read_idx_ += skip_samples_;
@@ -471,7 +552,7 @@ void LoRaProcessor::process_one_symbol() {
 // the os spectral aliases -> chips_per_symbol bins, argmax. Using the
 // oversampling (instead of resampling to 1 sample/chip) makes the peak robust
 // to sub-sample timing - the resample-to-N approach lost that and mis-decoded.
-int32_t LoRaProcessor::dechirp_at(uint32_t start) {
+int32_t LoRaRxChain::dechirp_at(uint32_t start) {
     const uint32_t sps = samples_per_symbol;
     const uint32_t N = chips_per_symbol;
     const uint32_t os = os_;
@@ -504,7 +585,7 @@ int32_t LoRaProcessor::dechirp_at(uint32_t start) {
 }
 
 // DOWN-chirp dechirp (multiply by exp(+jphi)) -> fold -> peak bin, for SFD detection.
-int32_t LoRaProcessor::dechirp_down(uint32_t start) {
+int32_t LoRaRxChain::dechirp_down(uint32_t start) {
     const uint32_t sps = samples_per_symbol;
     const uint32_t N = chips_per_symbol;
     const uint32_t os = os_;
@@ -542,7 +623,7 @@ int32_t LoRaProcessor::dechirp_down(uint32_t start) {
 
 // Same fold, but returns peak/total energy (sharpness) without touching state -
 // used by the brute-force fine-align to pick the best sample offset.
-float LoRaProcessor::sharpness_at(uint32_t start) {
+float LoRaRxChain::sharpness_at(uint32_t start) {
     const uint32_t sps = samples_per_symbol;
     const uint32_t N = chips_per_symbol;
     const uint32_t os = os_;
@@ -571,7 +652,7 @@ float LoRaProcessor::sharpness_at(uint32_t start) {
 
 // Same fold as sharpness_at() but over a CONTIGUOUS linear buffer (the preamble
 // snapshot), so the fine-align never races the ring writer.  Sets sharp_peak_bin_.
-float LoRaProcessor::sharpness_buf(const complex8_t* p) {
+float LoRaRxChain::sharpness_buf(const complex8_t* p) {
     const uint32_t sps = samples_per_symbol;
     const uint32_t N = chips_per_symbol;
     const uint32_t os = os_;
@@ -596,7 +677,7 @@ float LoRaProcessor::sharpness_buf(const complex8_t* p) {
     return tot > 0.0f ? pm / tot : 0.0f;
 }
 
-uint16_t LoRaProcessor::gray_decode(uint16_t value) const {
+uint16_t LoRaRxChain::gray_decode(uint16_t value) const {
     uint16_t mask = value >> 1;
     while (mask) {
         value ^= mask;
@@ -608,7 +689,7 @@ uint16_t LoRaProcessor::gray_decode(uint16_t value) const {
 // --- execute -----------------------------------------------------------------
 // Decimate to 1 MHz, append to the ring, then process whole symbols while there
 // is enough look-ahead buffered for the fine-align (3.sps + os).
-void LoRaProcessor::execute(const buffer_c8_t& buffer) {
+void LoRaRxChain::execute(const buffer_c8_t& buffer) {
     if (!rx_active) return;
     if (sf11_mode_) {
         execute_sf11(buffer);
@@ -716,17 +797,26 @@ void LoRaProcessor::execute(const buffer_c8_t& buffer) {
 
 // --- send_packet -------------------------------------------------------------
 
-void LoRaProcessor::set_rx_busy(bool busy) {
+void LoRaRxChain::set_rx_busy(bool busy) {
     if (rx_busy_ == busy) return;
     rx_busy_ = busy;
-    LoRaRxStatusMessage msg{busy};
+    const bool was = (*busy_mask_ != 0);
+    const uint8_t bit = static_cast<uint8_t>(1u << net_);
+    if (busy)
+        *busy_mask_ |= bit;
+    else
+        *busy_mask_ &= static_cast<uint8_t>(~bit);
+    const bool now = (*busy_mask_ != 0);
+    if (now == was) return;  // the other chain already said so
+    LoRaRxStatusMessage msg{now};
     shared_memory.application_queue.push(msg);
 }
 
-void LoRaProcessor::send_packet(const uint8_t* data, size_t len) {
+void LoRaRxChain::send_packet(const uint8_t* data, size_t len) {
     LoRaPacketMessage msg{};
     msg.length = static_cast<uint8_t>(std::min(len, sizeof(msg.data)));
     msg.crc_state = crc_state_;
+    msg.net = net_;
     for (size_t i = 0; i < msg.length; i++) msg.data[i] = data[i];
     // Approximate RSSI (dBm) from the packet's peak dechirp power. ref_peak_mag_
     // is |peak FFT bin|^2, so 10*log10 gives dB. log10 via a cheap IEEE-754
@@ -813,13 +903,14 @@ static bool g_dbg_ready = false;  // 6 bins captured, ready to send
 static int g_dbg_period = 999;    // per-mille |win[n]-win[n-SPS]| / |win[n]|
 #endif
 
-void LoRaProcessor::sf11_reset() {
+void LoRaRxChain::sf11_reset() {
     ref_peak_mag_ = 0.0f;  // per-packet RSSI accumulator (send_packet ran already)
     ref_sharp_acc_ = 0.0f;
     ref_sharp_n_ = 0;
     // Reception is over (delivered or abandoned): let the application transmit again.
     set_rx_busy(false);
     sf11_state_ = Sf11State::HUNT;
+    srch_pending_ = false;
     sf11_pre_run_ = 0;
     sf11_prev_bin_ = -99;
     sf11_confirmed_ = false;
@@ -848,7 +939,7 @@ void LoRaProcessor::sf11_reset() {
 // is the constant 2A: step z by d, and d by the fixed D, giving two complex multiplies
 // per sample and only three trig calls total (~0.1 ms).  Renormalise periodically so the
 // rotators can't drift off the unit circle.
-void LoRaProcessor::sf11_recompute_ref(float cfo_ramp) {
+void LoRaRxChain::sf11_recompute_ref(float cfo_ramp) {
     sf11_ref_ramp_ = cfo_ramp;
     if (sf11_gen_ref_) return;  // generated per chunk instead - nothing to fill
     const float A = static_cast<float>(M_PI) / static_cast<float>(sf11_sps_);
@@ -922,7 +1013,7 @@ static void lora_fft_stage(std::complex<float>* data, size_t n, size_t len) {
     }
 }
 
-void LoRaProcessor::sf11_demod_start(uint32_t win_start, bool is_up) {
+void LoRaRxChain::sf11_demod_start(uint32_t win_start, bool is_up) {
     sf11_job_start_ = win_start;
     sf11_job_up_ = is_up;
     sf11_job_step_ = 0;
@@ -934,8 +1025,8 @@ void LoRaProcessor::sf11_demod_start(uint32_t win_start, bool is_up) {
 // buffers (wait_for_buffer doesn't queue) - see the SF11_STEPS notes in the header.
 // Dechirp the window at sf11_job_start_ into sf11_fft() (xconj-ref, hand-rolled complex
 // multiply - see lora_fft_stage for the __mulsc3 reason).  Shared by the atomic and staged
-// demod paths; keeping ONE copy matters - the % SF11_WIN (non-power-of-2) is code-heavy.
-void LoRaProcessor::sf11_dechirp() {
+// demod paths; keeping ONE copy matters - the % win_len_ (non-power-of-2) is code-heavy.
+void LoRaRxChain::sf11_dechirp() {
     sf11_dechirp_chunk(0, 1);
 }
 
@@ -948,18 +1039,18 @@ void LoRaProcessor::sf11_dechirp() {
 // The window index is advanced by hand rather than recomputed with a modulo per sample:
 // the window length is not a power of two, so `%` is a division, and this loop is the
 // hottest in the receiver.
-void LoRaProcessor::sf11_dechirp_chunk(uint32_t part, uint32_t parts) {
+void LoRaRxChain::sf11_dechirp_chunk(uint32_t part, uint32_t parts) {
     const uint32_t n0 = part * sf11_sps_ / parts;
     const uint32_t n1 = (part + 1u) * sf11_sps_ / parts;
     float* const out = reinterpret_cast<float*>(sf11_fft());
     const float cs = sf11_job_up_ ? 1.0f : -1.0f;  // conj(ref) for the down-chirp ref
-    uint32_t idx = (sf11_job_start_ + n0) % SF11_WIN;
+    uint32_t idx = (sf11_job_start_ + n0) % win_len_;
 
     if (!sf11_gen_ref_) {
         const float* const ref = reinterpret_cast<const float*>(sf11_ref());
         for (uint32_t n = n0; n < n1; ++n) {
             const auto& c = sf11_win()[idx];
-            if (++idx == SF11_WIN) idx = 0;
+            if (++idx == win_len_) idx = 0;
             const float xr = static_cast<float>(c.real()), xi = static_cast<float>(c.imag());
             const float rr = ref[2 * n], ri = cs * ref[2 * n + 1];
             out[2 * n] = xr * rr - xi * ri;
@@ -984,7 +1075,7 @@ void LoRaProcessor::sf11_dechirp_chunk(uint32_t part, uint32_t parts) {
     float zr = sf11_gz_r_, zi = sf11_gz_i_, dr = sf11_gd_r_, di = sf11_gd_i_;
     for (uint32_t n = n0; n < n1; ++n) {
         const auto& c = sf11_win()[idx];
-        if (++idx == SF11_WIN) idx = 0;
+        if (++idx == win_len_) idx = 0;
         const float xr = static_cast<float>(c.real()), xi = static_cast<float>(c.imag());
         const float rr = zr, ri = cs * zi;
         out[2 * n] = xr * rr - xi * ri;
@@ -1010,7 +1101,7 @@ void LoRaProcessor::sf11_dechirp_chunk(uint32_t part, uint32_t parts) {
     sf11_gd_i_ = di;
 }
 
-bool LoRaProcessor::sf11_demod_step() {
+bool LoRaRxChain::sf11_demod_step() {
     // Adaptive staged demod: the log2(sps) butterfly stages are split across sf11_nsteps_
     // (= sps/256 = buffers/symbol) bounded steps, one per M4 buffer, so a symbol's demod
     // finishes within the symbol's own buffers for EVERY BW250 SF - SF8 nsteps=1 (atomic:
@@ -1113,12 +1204,13 @@ bool LoRaProcessor::sf11_demod_step() {
 
 // gr-lora deinterleave/hamming/dewhiten from a da's buffered bins, at a given `off`.
 // Fills out[] with de-whitened bytes; returns length L (or 0 on bad header).
-// (Self-contained locals - no member side effects, so many candidates can be tried.)
+// (Self-contained locals, so many candidates can be tried; the only members written are
+// the cand_* notes about the candidate just decoded.)
 
 // Decode the frame from a da's buffered bins at `off`.  Returns L (0 = bad header).
 // Only decodes what the buffered SF11_FINE_SYMS bins allow (header + first payload
 // bytes - enough to check the broadcast dest); the winner re-decodes the full payload.
-uint8_t LoRaProcessor::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32_t off, uint8_t* out, uint8_t out_cap) {
+uint8_t LoRaRxChain::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32_t off, uint8_t* out, uint8_t out_cap) {
     const int N = static_cast<int>(chips_per_symbol);    // 2048
     const int SFv = static_cast<int>(spreading_factor);  // 11
     // header block: 8 reduced-rate symbols -> SF-2 nibbles (Hamming-correct)
@@ -1159,12 +1251,15 @@ uint8_t LoRaProcessor::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint
     // (cr << 1) | has_crc, so 4 + cr is the symbols-per-block the transmitter used.
     const int hdr_cr = (nib[2] >> 1) & 7;
     if (hdr_cr < 1 || hdr_cr > 4) return 0;
+    cand_crc_ = (nib[2] & 1) != 0;
     const int cw_len = 4 + hdr_cr;
     // Under LDRO a symbol carries SF-2 bits: the two low chips are dropped and the block
     // deinterleaves to SF-2 code words, not SF. This loop assumed SF unconditionally,
     // which is right at BW250 (never LDRO) and wrong for every BW125 preset above SF10 -
     // the candidate frame came out with two of the four broadcast bytes right.
     const int ppm = use_ldro_ ? (SFv - 2) : SFv;
+    uint8_t parity_bad = 0;  // first payload block's code words that fail their parity
+    bool block_seen = false;
     for (int bi = 8; bi + cw_len <= nbins && pc + ppm <= (int)sizeof(pnib); bi += cw_len) {
         uint16_t pg[16];
         for (int i = 0; i < cw_len; i++) {
@@ -1174,8 +1269,23 @@ uint8_t LoRaProcessor::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint
         }
         uint16_t pcw[16];
         lora::deinterleave(pg, ppm, cw_len, pcw);
-        for (int c = 0; c < ppm; c++) pnib[pc++] = lora::hamming_top4(pcw[c], cw_len);
+        for (int c = 0; c < ppm; c++) {
+            const uint8_t nibble = lora::hamming_top4(pcw[c], cw_len);
+            if (bi == 8) {
+                block_seen = true;
+                // lora::hamming_encode(nibble, cw_len - 4), from its CR 4/8 code words: the
+                // shorter codes are their top bits, except 4/5, whose one parity bit
+                // covers all four data bits. (The M4 image has no room for the function.)
+                static constexpr uint8_t H84[16] = {0x00, 0x8B, 0x4E, 0xC5, 0x2D, 0xA6, 0x63, 0xE8,
+                                                    0x17, 0x9C, 0x59, 0xD2, 0x3A, 0xB1, 0x74, 0xFF};
+                uint32_t want = H84[nibble] >> (8 - cw_len);
+                if (cw_len == 5) want = (want & 0x1Eu) | ((0x6996u >> nibble) & 1u);
+                if (want != pcw[c]) ++parity_bad;
+            }
+            pnib[pc++] = nibble;
+        }
     }
+    cand_parity_bad_ = block_seen ? parity_bad : 0xFF;
     uint8_t st = 0xFF;
     int nbytes = pc / 2;
     for (int i = 0; i < nbytes && i < out_cap; i++) {
@@ -1189,9 +1299,38 @@ uint8_t LoRaProcessor::sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint
     return L;
 }
 
-// Decode every buffered (da, off) candidate; on the first valid-checksum BROADCAST
-// frame, set up the payload chain to continue streaming and return true.
-bool LoRaProcessor::sf11_try_decode() {
+// Whether a candidate's first four bytes look like a frame of this chain's network.
+bool LoRaRxChain::header_plausible(const uint8_t* frame, uint8_t len) const {
+    if (gate_ == Gate::Meshtastic) {
+        // The first 4 bytes are the Meshtastic destination. Accept a broadcast, or a
+        // unicast addressed to us - the old broadcast-only test made every direct
+        // message (and every unicast ACK) invisible.
+        const uint32_t dest = static_cast<uint32_t>(frame[0]) |
+                              (static_cast<uint32_t>(frame[1]) << 8) |
+                              (static_cast<uint32_t>(frame[2]) << 16) |
+                              (static_cast<uint32_t>(frame[3]) << 24);
+        return dest == 0xFFFFFFFFu || (local_node_id_ && dest == local_node_id_);
+    }
+    // MeshCore (src/Packet.h): every node sends a payload CRC; header byte 0bVVPPPPRR with
+    // version 0 and a known payload type; then, unless transport codes come first, the
+    // path length byte, whose top two bits give the hash size (3 = reserved) and whose
+    // path has to fit the frame with at least one payload byte behind it.
+    if (!cand_crc_) return false;
+    if ((frame[0] >> 6) != 0) return false;
+    const uint8_t type = (frame[0] >> 2) & 0x0F;
+    if (type >= 12 && type <= 14) return false;
+    const uint8_t route = frame[0] & 0x03;
+    if (route == 0 || route == 3) return len >= 7;
+    const uint8_t pl = frame[1];
+    if ((pl >> 6) == 3) return false;
+    const uint32_t need = 2u + static_cast<uint32_t>(pl & 0x3F) * ((pl >> 6) + 1u) + 1u;
+    return len >= need;
+}
+
+// Meshtastic: decode every buffered (da, off) candidate; on the first valid-checksum
+// frame addressed to everyone or to us, set up the payload chain to continue streaming
+// and return true. (MeshCore's search is sf11_search_begin/step.)
+bool LoRaRxChain::sf11_try_decode() {
     const int N = static_cast<int>(chips_per_symbol);
 #if SF11_DEBUG
     g_dbg_lead = -1;
@@ -1232,83 +1371,8 @@ bool LoRaProcessor::sf11_try_decode() {
                         }
                     }
 #endif
-                    // Header validity gate: the first 4 bytes are the Meshtastic destination.
-                    // Accept a broadcast, or a unicast addressed to us - the old broadcast-only
-                    // test made every direct message (and every unicast ACK) invisible.
-                    if (L < 4) continue;
-                    const uint32_t dest = static_cast<uint32_t>(frame[0]) |
-                                          (static_cast<uint32_t>(frame[1]) << 8) |
-                                          (static_cast<uint32_t>(frame[2]) << 16) |
-                                          (static_cast<uint32_t>(frame[3]) << 24);
-                    if (dest != 0xFFFFFFFFu && !(local_node_id_ && dest == local_node_id_))
-                        continue;
-                    // -- WINNER -- set up the member chain, then keep streaming the payload.
-                    sf11_win_da_ = da;
-                    sf11_win_off_ = off;
-                    for (int i = 0; i < 8; i++) {
-                        int a = (((int)B[i] - (int)off) % N + N) % N;
-                        a = static_cast<int>(lora::ldro_div4(static_cast<uint32_t>(a), static_cast<uint32_t>(N)));
-                        hdr_sym_[i] = static_cast<uint16_t>(a ^ (a >> 1));
-                    }
-                    const uint8_t len = decode_header();  // sets header_valid_ + hdr_extra_*
-                    if (!header_valid_ || len < 4 || len > MAX_PAYLOAD) continue;
-#if SF11_DEBUG
-                    {  // WINNER: broadcast dest + valid header. Show src (frame[4..7]) + len.
-                        uint8_t wm[8] = {0xEA, len, frame[4], frame[5], frame[6], frame[7],
-                                         (uint8_t)hs, (uint8_t)(int8_t)0};
-                        send_packet(wm, 8);
-                    }
-#endif
-                    payload_len_target_ = len;
-                    sym_in_block_ = 0;
-                    payload_sym_count_ = 0;
-                    nibble_lo_valid_ = false;
-                    whiten_state_ = 0xFF;
-                    decoded_len_ = 0;
-                    for (uint8_t k = 0; k < hdr_extra_cnt_; ++k) feed_nibble(hdr_extra_nib_[k]);
-                    for (uint8_t i = 8; i < nb; i++) {
-                        uint32_t sv = static_cast<uint32_t>(((int)B[i] - (int)off) % N + N) % N;
-                        // The third place LDRO had to be applied: these are the payload
-                        // symbols already buffered during FINE, replayed into the streaming
-                        // block machinery. Without the shift the first block or two of every
-                        // BW125 packet decoded from unreduced symbol values - the frame's
-                        // first four bytes came out right (the header search checks those)
-                        // and the channel-hash byte after them did not, so the M0 dropped
-                        // the packet at its channel filter without a trace.
-                        if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
-                        sym_block_[sym_in_block_++] = static_cast<uint16_t>(sv ^ (sv >> 1));
-                        if (sym_in_block_ >= rx_cw_len_) {
-                            process_sym_block();
-                            sym_in_block_ = 0;
-                            if (payload_len_target_ && payload_complete()) {
-#if SF11_DEBUG
-                                {  // dump first 6 payload bytes + drop flag (miss delta since FINE start)
-                                    uint16_t dmiss = (uint16_t)(shared_memory.m4_buffer_missed - sf11_miss0_);
-                                    uint8_t pm[8] = {0xE9, (uint8_t)(dmiss > 255 ? 255 : dmiss),
-                                                     payload_buf[4], payload_buf[5], payload_buf[6],
-                                                     payload_buf[7], payload_buf[13], (uint8_t)decoded_len_};
-                                    send_packet(pm, 8);
-                                }
-#endif
-                                check_payload_crc(payload_len_target_);
-                                send_packet(payload_buf.data(), payload_len_target_);
-                                sf11_reset();
-                                return true;
-                            }
-                        }
-                    }
-                    // The buffer always ends at h0+(FINE_SYMS-1)*SPS, so the next live payload
-                    // symbol is at h0+FINE_SYMS*SPS regardless of hs; only the count already
-                    // consumed from the buffer changes.
-                    sf11_read_ = static_cast<uint32_t>((long)sf11_h0_ + da + (long)sf11_fine_syms_ * sf11_sps_);
-                    sf11_pay_have_ = static_cast<uint16_t>(sf11_fine_syms_ - hs - 8);
-                    sf11_state_ = Sf11State::PAYLOAD;
-                    // Header locked, payload streaming: tell the application to hold its
-                    // transmitter. A long packet takes ~0.8 s on air at LongFast, far more
-                    // than the TX countdown, and switching to the TX baseband unloads this
-                    // demodulator - which silently killed every long reception.
-                    set_rx_busy(true);
-                    return true;
+                    if (L < 4 || !header_plausible(frame, L)) continue;
+                    if (sf11_commit(B, nb, da, off, hs)) return true;
                 }
             }
         }
@@ -1316,9 +1380,128 @@ bool LoRaProcessor::sf11_try_decode() {
     return false;
 }
 
+// MeshCore's header search (see srch_pending_ in the header): both header starts, and for
+// each the offsets nearest the measured one first, so a tie in the score goes to the
+// measurement. The winner is the first candidate with the fewest parity failures; one
+// with none cannot be beaten, so the search ends there - on a clean packet usually
+// within a few candidates.
+void LoRaRxChain::sf11_search_begin() {
+    srch_pending_ = true;
+    srch_next_ = 0;
+    srch_best_bad_ = 0xFF;
+    srch_best_hs_ = -1;
+    srch_best_off_ = 0;
+    // Begun late in a buffer (straight after a demod step), the first slice waits for the
+    // next one, which resumes it before any other work of the chain.
+    if (cycles_now() - g_buf_t0 < SEARCH_DEADLINE_CYCLES) sf11_search_step();
+}
+
+void LoRaRxChain::sf11_search_step() {
+    static_assert(SF11_DA == 0, "the sliced search assumes a single da candidate");
+    constexpr int PER_HS = 2 * SF11_OFF_RAD + 1;
+    constexpr int TOTAL = (SF11_HS_MAX + 1) * PER_HS;
+    const int N = static_cast<int>(chips_per_symbol);
+    bool first = true;  // at least one candidate per slice, so the search always moves
+    while (srch_next_ < TOTAL) {
+        if (!first && cycles_now() - g_buf_t0 > SEARCH_DEADLINE_CYCLES) return;  // the rest next buffer
+        first = false;
+        const int hs = srch_next_ / PER_HS, k = srch_next_ % PER_HS;
+        ++srch_next_;
+        const int od = (k & 1) ? -((k + 1) / 2) : (k / 2);  // 0, -1, +1, -2, +2, ...
+        const uint32_t off = static_cast<uint32_t>(((int)sf11_off0_ + od) % N + N) % N;
+        uint8_t frame[12];
+        const uint8_t L = sf11_decode_bins(&sf11_bins_[SF11_DA][hs], static_cast<uint8_t>(sf11_fine_syms_ - hs),
+                                           off, frame, sizeof(frame));
+        if (L < 4 || !header_plausible(frame, L)) continue;
+        if (cand_parity_bad_ < srch_best_bad_) {
+            srch_best_bad_ = cand_parity_bad_;
+            srch_best_hs_ = static_cast<int8_t>(hs);
+            srch_best_off_ = off;
+            if (srch_best_bad_ == 0) break;
+        }
+    }
+    srch_pending_ = false;
+    // One wrong symbol in the block spoils the parity of up to SF code words, so this
+    // allows a damaged block through; a misaligned one fails nearly all of them.
+    if (srch_best_hs_ < 0 || srch_best_bad_ > spreading_factor / 2 ||
+        !sf11_commit(&sf11_bins_[SF11_DA][srch_best_hs_], static_cast<uint8_t>(sf11_fine_syms_ - srch_best_hs_), 0,
+                     srch_best_off_, srch_best_hs_))
+        sf11_reset();
+}
+
+// The chosen candidate: decode its header into the member chain, replay the payload
+// symbols already buffered, and keep streaming the rest (or deliver at once when the
+// whole frame was in the buffer).
+bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off, int hs) {
+    const int N = static_cast<int>(chips_per_symbol);
+    sf11_win_da_ = da;
+    sf11_win_off_ = off;
+    for (int i = 0; i < 8; i++) {
+        int a = (((int)B[i] - (int)off) % N + N) % N;
+        a = static_cast<int>(lora::ldro_div4(static_cast<uint32_t>(a), static_cast<uint32_t>(N)));
+        hdr_sym_[i] = static_cast<uint16_t>(a ^ (a >> 1));
+    }
+    const uint8_t len = decode_header();  // sets header_valid_ + hdr_extra_*
+    if (!header_valid_ || len < 4 || len > MAX_PAYLOAD) return false;
+    payload_len_target_ = len;
+    // How many payload symbols to wait for before giving the frame up. Meshtastic keeps
+    // the fixed limit it has always had. A MeshCore frame at CR 4/8 passes that limit at
+    // about 108 bytes - an advert with a name is longer - so there the header's own
+    // length decides: two nibbles a byte, the CRC included, in blocks of rx_cw_len_
+    // symbols, and one block to spare.
+    sf11_pay_need_ = PAYLOAD_SYM_LIMIT;
+    if (gate_ != Gate::Meshtastic) {
+        const uint32_t per_block = use_ldro_ ? spreading_factor - 2u : spreading_factor;
+        const uint32_t nibbles = 2u * (len + (hdr_has_crc_ ? 2u : 0u));
+        sf11_pay_need_ = static_cast<uint16_t>(((nibbles + per_block - 1u) / per_block + 1u) * rx_cw_len_);
+    }
+    erase_mask_ = 0;
+    sharp_ref_ = (sf11_res_bestsh_ > 0.0f) ? sf11_res_bestsh_ : 0.0f;
+    sym_in_block_ = 0;
+    payload_sym_count_ = 0;
+    nibble_lo_valid_ = false;
+    whiten_state_ = 0xFF;
+    decoded_len_ = 0;
+    for (uint8_t k = 0; k < hdr_extra_cnt_; ++k) feed_nibble(hdr_extra_nib_[k]);
+    for (uint8_t i = 8; i < nb; i++) {
+        uint32_t sv = static_cast<uint32_t>(((int)B[i] - (int)off) % N + N) % N;
+        // The third place LDRO had to be applied: these are the payload
+        // symbols already buffered during FINE, replayed into the streaming
+        // block machinery. Without the shift the first block or two of every
+        // BW125 packet decoded from unreduced symbol values - the frame's
+        // first four bytes came out right (the header search checks those)
+        // and the channel-hash byte after them did not, so the M0 dropped
+        // the packet at its channel filter without a trace.
+        if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
+        sym_block_[sym_in_block_++] = static_cast<uint16_t>(sv ^ (sv >> 1));
+        if (sym_in_block_ >= rx_cw_len_) {
+            process_sym_block();
+            sym_in_block_ = 0;
+            if (payload_len_target_ && payload_complete()) {
+                check_payload_crc(payload_len_target_);
+                send_packet(payload_buf.data(), payload_len_target_);
+                sf11_reset();
+                return true;
+            }
+        }
+    }
+    // The buffer always ends at h0+(FINE_SYMS-1)*SPS, so the next live payload
+    // symbol is at h0+FINE_SYMS*SPS regardless of hs; only the count already
+    // consumed from the buffer changes.
+    sf11_read_ = static_cast<uint32_t>((long)sf11_h0_ + da + (long)sf11_fine_syms_ * sf11_sps_);
+    sf11_pay_have_ = static_cast<uint16_t>(sf11_fine_syms_ - hs - 8);
+    sf11_state_ = Sf11State::PAYLOAD;
+    // Header locked, payload streaming: tell the application to hold its
+    // transmitter. A long packet takes ~0.8 s on air at LongFast, far more
+    // than the TX countdown, and switching to the TX baseband unloads this
+    // demodulator - which silently killed every long reception.
+    set_rx_busy(true);
+    return true;
+}
+
 // SF11 streaming: decimate /8 -> 250 kHz, append to win11, run the state machine with a
 // per-call FFT budget (spread across the 8192-sample ~4 ms deadline).
-void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
+void LoRaRxChain::execute_sf11(const buffer_c8_t& buffer) {
     // buffer_t has const members, so the second stage cannot be assigned over the first.
     const auto d8 = decim8_.execute(buffer, decim_buffer);
     const auto d4 = (bw125_ || bw62_) ? decim2_.execute(d8, decim_buffer2) : d8;
@@ -1373,7 +1556,7 @@ void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
             sq = 127;
         else if (sq < -127)
             sq = -127;
-        sf11_win()[win_w_ % SF11_WIN] = complex8_t{static_cast<int8_t>(si), static_cast<int8_t>(sq)};
+        sf11_win()[win_w_ % win_len_] = complex8_t{static_cast<int8_t>(si), static_cast<int8_t>(sq)};
         ++win_w_;
 #if SF11_DEBUG
         {
@@ -1392,7 +1575,7 @@ void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
     {
         static uint32_t dbg_e = 0;
         for (size_t i = 0; i < result.count; ++i) {
-            const auto& s = sf11_win()[(win_w_ - result.count + i) % SF11_WIN];
+            const auto& s = sf11_win()[(win_w_ - result.count + i) % win_len_];
             int a = s.real();
             if (a < 0) a = -a;
             int b = s.imag();
@@ -1409,8 +1592,8 @@ void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
                 if (++g_dbg_capi == 2) {
                     float cre = 0.0f, cim = 0.0f, pw = 0.0f;
                     for (uint32_t i = 0; i < sf11_sps_; ++i) {
-                        const auto& a = sf11_win()[(win_w_ - sf11_sps_ + i) % SF11_WIN];
-                        const auto& b = sf11_win()[(win_w_ - 2u * sf11_sps_ + i) % SF11_WIN];
+                        const auto& a = sf11_win()[(win_w_ - sf11_sps_ + i) % win_len_];
+                        const auto& b = sf11_win()[(win_w_ - 2u * sf11_sps_ + i) % win_len_];
                         const float ar = a.real(), ai = a.imag(), br = b.real(), bi = b.imag();
                         cre += ar * br + ai * bi;
                         cim += ai * br - ar * bi;
@@ -1475,7 +1658,12 @@ void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
     // deadline, and an overrun SKIPS buffers rather than queueing them, which shreds the
     // stream (42% of buffers lost, preamble reads as non-periodic).  See the SF11_STEPS
     // budget notes in the header.
+    if (srch_pending_) {
+        sf11_search_step();
+        if (srch_pending_) return;  // the samples wait in the ring; the demod resumes after
+    }
     for (uint32_t k = 0; k < sf11_steps_per_call_; ++k) {
+        if (srch_pending_) return;                           // a search began in this buffer and ran out of time
         if (!sf11_job_active_ && !sf11_start_job()) return;  // nothing ready to demod
         if (!sf11_demod_step()) continue;                    // still working on this one
         sf11_job_active_ = false;
@@ -1487,12 +1675,12 @@ void LoRaProcessor::execute_sf11(const buffer_c8_t& buffer) {
 // state machine has fallen behind real time.  win11 only holds SF11_WIN samples, so a
 // stage that needs more demods per symbol than the step budget delivers silently reads
 // stale data instead of the signal.  Bail to HUNT rather than decode garbage.
-bool LoRaProcessor::sf11_win_stale(uint32_t start) const {
-    return (win_w_ - start) > (uint32_t)(SF11_WIN - sf11_sps_);
+bool LoRaRxChain::sf11_win_stale(uint32_t start) const {
+    return (win_w_ - start) > (win_len_ - sf11_sps_);
 }
 
 // Picks the next window to demod for the current state.  false = samples not ready yet.
-bool LoRaProcessor::sf11_start_job() {
+bool LoRaRxChain::sf11_start_job() {
     switch (sf11_state_) {
         case Sf11State::HUNT: {
             if (win_w_ - sf11_read_ < sf11_sps_) return false;
@@ -1538,7 +1726,7 @@ bool LoRaProcessor::sf11_start_job() {
 }
 
 // Acts on a finished demod (result in last_peak_bin_ / sf11_last_sharp_ / sf11_last_pk_).
-void LoRaProcessor::sf11_consume() {
+void LoRaRxChain::sf11_consume() {
     const int N = static_cast<int>(chips_per_symbol);
     const int32_t bin = static_cast<int32_t>(last_peak_bin_);
     const float sh = sf11_last_sharp_;
@@ -1579,8 +1767,8 @@ void LoRaProcessor::sf11_consume() {
                 if (g_dbg_capi == 2 && sf11_read_ > (uint32_t)sf11_sps_) {
                     float cre = 0.0f, cim = 0.0f, pw = 0.0f;
                     for (uint32_t i = 0; i < sf11_sps_; ++i) {
-                        const auto& a = sf11_win()[(sf11_read_ + i) % SF11_WIN];
-                        const auto& b = sf11_win()[(sf11_read_ - sf11_sps_ + i) % SF11_WIN];
+                        const auto& a = sf11_win()[(sf11_read_ + i) % win_len_];
+                        const auto& b = sf11_win()[(sf11_read_ - sf11_sps_ + i) % win_len_];
                         const float ar = a.real(), ai = a.imag(), br = b.real(), bi = b.imag();
                         cre += ar * br + ai * bi;
                         cim += ai * br - ar * bi;
@@ -1618,8 +1806,9 @@ void LoRaProcessor::sf11_consume() {
                 sf11_cfo_ramp_ = std::arg(sf11_cfo_acc_) / static_cast<float>(sf11_sps_);
                 sf11_recompute_ref(sf11_cfo_ramp_);
                 sf11_off0_ = static_cast<uint32_t>(((int)sf11_up_bin_ - tau) % N + N) % N;
+                // 2.25 symbols, exact: a symbol is a power of two of at least 128 samples.
                 sf11_h0_ = static_cast<uint32_t>((long)sf11_read_ +
-                                                 (long)llroundf(2.25f * sf11_sps_) - tau);
+                                                 (long)(sf11_sps_ * 9u / 4u) - tau);
                 // Resolve the tau mod-N/2 ambiguity before FINE (see RESOLVE state).
                 sf11_state_ = Sf11State::RESOLVE;
                 sf11_res_idx_ = 0;
@@ -1633,7 +1822,7 @@ void LoRaProcessor::sf11_consume() {
 #endif
             } else {
                 sf11_read_ += sf11_sps_;
-                if (sf11_read_ - sf11_pre_pos_ > 24u * sf11_sps_) sf11_reset();  // no SFD -> bail
+                if (sf11_read_ - sf11_pre_pos_ > sfd_wait_syms_ * sf11_sps_) sf11_reset();  // no SFD -> bail
             }
         }
     } else if (sf11_state_ == Sf11State::RESOLVE) {
@@ -1685,7 +1874,9 @@ void LoRaProcessor::sf11_consume() {
         if (++sf11_fine_da_ >= SF11_NDA) {
             sf11_fine_da_ = 0;
             if (++sf11_fine_sym_ >= sf11_fine_syms_) {
-                if (!sf11_try_decode()) {
+                if (gate_ != Gate::Meshtastic) {
+                    sf11_search_begin();  // decides now, or over the next buffers
+                } else if (!sf11_try_decode()) {
 #if SF11_DEBUG
                     g_dbg_stage = 2;
                     g_dbg_stage_ready = true;  // DEC marker shows the best-aligned bytes
@@ -1711,6 +1902,14 @@ void LoRaProcessor::sf11_consume() {
         // otherwise - and folding the residual into the group decision was the last one
         // left. If the boundary survives this, the fault is older than anything I added.
         if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
+        // MeshCore at CR 4/8: a symbol far less distinct than the packet's own run of them
+        // is marked as an erasure (see process_sym_block); the others keep the reference.
+        if (gate_ != Gate::Meshtastic && rx_cw_len_ == 8) {
+            if (sharp_ref_ > 0.0f && sh < sharp_ref_ * ERASE_SHARP_FRACTION)
+                erase_mask_ = static_cast<uint8_t>(erase_mask_ | (1u << sym_in_block_));
+            else
+                sharp_ref_ = (sharp_ref_ > 0.0f) ? sharp_ref_ + (sh - sharp_ref_) * 0.125f : sh;
+        }
         // A tracking loop used to sit here and it was wrong in its premise. The residual
         // is where the peak sits INSIDE its bin, not evidence that the peak is moving:
         // a signal parked at b+0.3 hands over +0.3 every symbol, and integrating that
@@ -1739,27 +1938,19 @@ void LoRaProcessor::sf11_consume() {
                 return;
             }
         }
-        if (++sf11_pay_have_ >= PAYLOAD_SYM_LIMIT) {
+        if (++sf11_pay_have_ >= sf11_pay_need_) {
             send_truncated(4);
             sf11_reset();
         }
     }
 }
 
-void LoRaProcessor::on_message(const Message* const message) {
-    if (message->id == Message::ID::LoRaConfigure)
-        configure(*reinterpret_cast<const LoRaConfigureMessage*>(message));
-    else if (message->id == Message::ID::AudioBeep) {
-        const auto& b = *reinterpret_cast<const AudioBeepMessage*>(message);
-        audio::dma::beep_start(b.freq, b.sample_rate, b.duration_ms);
-    }
-}
-
-void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
-    spreading_factor = msg.spreading_factor;
-    bandwidth = msg.bandwidth;
-    coding_rate = msg.coding_rate;
-    local_node_id_ = msg.local_node_id;
+void LoRaRxChain::configure(uint8_t sf, uint32_t bw, uint8_t cr, uint32_t node_id) {
+    set_rx_busy(false);  // whatever was being received under the old settings is over
+    spreading_factor = sf;
+    bandwidth = bw;
+    coding_rate = cr;
+    local_node_id_ = node_id;
     chips_per_symbol = 1u << spreading_factor;
     // -- BW250 STREAMING path (SF7..SF11 - payloads won't fit the ring): decim8 -> 250 kHz,
     // per-symbol dechirp+FFT, staged across sps/256 buffers/symbol (SF8=1 atomic ... SF11=8);
@@ -1820,10 +2011,11 @@ void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
         // takes the same threshold as SF7 at BW250, whose symbols are also 128 points.
         // NARROW_SLOW (256 points) stays with SF8 at BW250, which is unscaled.
         if (sf11_sps_ < sf11_out_per_buf_ || (bw62_ && sf11_sps_ <= 128u)) {
-            const float noise_here = logf(static_cast<float>(sf11_sps_)) /
-                                     static_cast<float>(sf11_sps_);
-            const float noise_sf11 = logf(2048.0f) / 2048.0f;
-            sf11_sharp_thr_ = SF11_SHARP_THR * (noise_here / noise_sf11);
+            // ln(sps)/sps over ln(2048)/2048. sps = 2^SF, so the logarithms are SF and 11
+            // times ln 2, which cancels - and logf, with the double-precision helpers it
+            // drags in, does not fit the 32 KiB M4 code area alongside a second chain.
+            sf11_sharp_thr_ = SF11_SHARP_THR * (static_cast<float>(spreading_factor * 2048u) /
+                                                static_cast<float>(11u * sf11_sps_));
         }
         // Above the stored reference's size the reference is generated on the fly and the
         // FFT moves to the front of the ring; the dechirp is cut into chunks small enough
@@ -1859,8 +2051,10 @@ void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
     use_ldro_ = lora::ldro_needed(spreading_factor, bandwidth);
 
     const uint32_t dec_fs = static_cast<uint32_t>(baseband_fs) / DECIM;  // 1 MHz
-    samples_per_symbol = static_cast<uint32_t>(
-        ((uint64_t)chips_per_symbol * dec_fs + bandwidth / 2u) / bandwidth);
+    // round(chips * dec_fs / bw) in 32 bits (chips <= 4096, so chips * (dec_fs % bw) fits):
+    // a 64-bit division would bring a 700-byte library routine into the M4 image.
+    samples_per_symbol = chips_per_symbol * (dec_fs / bandwidth) +
+                         (chips_per_symbol * (dec_fs % bandwidth) + bandwidth / 2u) / bandwidth;
     os_ = (chips_per_symbol > 0) ? (samples_per_symbol / chips_per_symbol) : 1u;
 
     // Precompute the conjugate reference chirp for one symbol (sps samples):
@@ -1885,6 +2079,141 @@ void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
     in_packet_ = false;
     low_run_ = 0;
     reset_rx();
+}
+
+// ===========================================================================
+//  The processor: one or two chains on one stream
+// ===========================================================================
+
+LoRaProcessor::LoRaProcessor() {
+#if defined(__arm__)
+    // The cycle counter, for the Meshtastic-first budget in execute().
+    *reinterpret_cast<volatile uint32_t*>(0xE000EDFCu) |= (1u << 24);  // DEMCR.TRCENA
+    *reinterpret_cast<volatile uint32_t*>(0xE0001000u) |= 1u;          // DWT_CTRL.CYCCNTENA
+#endif
+    main_.attach(ring_.data(), 0, LoRaRxChain::SF11_SPS * 4, LoRaRxChain::SF11_SPS * 8, LoRaRxChain::SF11_WIN);
+    main_.set_identity(0, LoRaRxChain::Gate::Meshtastic, &busy_mask_);
+    // Second chain, used only when both chains stream at SF <= 8 (a symbol of at most 256
+    // samples). The main chain then occupies, in complex8 units: reference [0, 1024),
+    // FFT [8192, 9216) and window [16384, 27648). The second takes three of the gaps.
+    aux_.attach(ring_.data(), 2048, 4096, 9216, 16384 - 9216);
+    aux_.set_identity(1, LoRaRxChain::Gate::MeshCore, &busy_mask_);
+    const float amp = 16383.0f;
+    for (uint32_t k = 0; k < nco_lut_.size(); ++k) {
+        const float ph = 2.0f * static_cast<float>(M_PI) * static_cast<float>(k) / static_cast<float>(nco_lut_.size());
+        // Rounded by hand: lrintf would pull another libm function into an image that
+        // has to fit 32 KiB.
+        const float fc = amp * cosf(ph), fs = amp * sinf(ph);
+        const int16_t c = static_cast<int16_t>(fc + (fc < 0.0f ? -0.5f : 0.5f));
+        const int16_t sn = static_cast<int16_t>(fs + (fs < 0.0f ? -0.5f : 0.5f));
+        nco_lut_[k] = static_cast<uint16_t>(c) | (static_cast<uint32_t>(static_cast<uint16_t>(sn)) << 16);
+    }
+}
+
+void LoRaProcessor::execute(const buffer_c8_t& buffer) {
+    const uint32_t t0 = cycles_now();
+    g_buf_t0 = t0;
+    main_.execute(buffer);  // takes what it needs from the buffer first
+    const uint32_t t1 = cycles_now();
+    if (aux_on_) {
+        if (t1 - t0 > MAIN_BUDGET_CYCLES) {
+            // Meshtastic first (see MAIN_BUDGET_CYCLES). Keep the shift's phase running
+            // over the samples skipped, so the second chain restarts on a clean tone.
+            nco_phase_ += nco_step_ * static_cast<uint32_t>(buffer.count);
+            aux_.drop_buffer();
+        } else {
+            shift_for_aux(buffer);  // ...so the second chain can have it, shifted, in place
+            aux_.execute(buffer);
+        }
+    }
+}
+
+// (x >> 14) saturated to int8, in one instruction on the M4 (the compiler keeps the shift
+// and the saturation apart).
+static inline int32_t ssat8_asr14(int32_t x) {
+#if defined(__arm__)
+    int32_t r;
+    asm("ssat %0, #8, %1, asr #14" : "=r"(r) : "r"(x));
+    return r;
+#else
+    return __SSAT(x >> 14, 8);
+#endif
+}
+
+// x * exp(j*phase) on int8 I/Q, in place: I' = I*c - Q*s, Q' = I*s + Q*c. Full scale,
+// saturating: a weak signal keeps every bit it had, and only a sample already at the
+// ADC's limit can clip in the rotation.
+//
+// Two samples per word, on the M4's dual 16-bit multiply-accumulates (SMLSD for the real
+// part, SMLADX for the imaginary) with the rounding constant as the accumulator. The
+// plain loop took ~40 cycles a sample - 0.4 ms of every 1.024 ms buffer - which with the
+// second chain ran each buffer just past its deadline and dropped every other one.
+void LoRaProcessor::shift_for_aux(const buffer_c8_t& buffer) {
+    uint32_t ph = nco_phase_;
+    const uint32_t step = nco_step_;
+    constexpr uint32_t SHIFT = 32 - NCO_BITS;
+    const uint32_t* const lut = nco_lut_.data();
+    auto* const w = reinterpret_cast<uint32_t*>(buffer.p);  // [I0 Q0 I1 Q1] per word
+    const size_t words = buffer.count / 2;
+    for (size_t k = 0; k < words; ++k) {
+        const uint32_t v = w[k];
+        const uint32_t i1i0 = __SXTB16(v, 0);
+        const uint32_t q1q0 = __SXTB16(v, 8);
+        const uint32_t x0 = __PKHBT(i1i0, q1q0, 16);  // Q0:I0
+        const uint32_t x1 = __PKHTB(q1q0, i1i0, 16);  // Q1:I1
+        const uint32_t l0 = lut[ph >> SHIFT];         // sin:cos
+        ph += step;
+        const uint32_t l1 = lut[ph >> SHIFT];
+        ph += step;
+        // Signed: CMSIS returns these as uint32_t, and a logical shift would turn every
+        // negative product into a large positive one.
+        const int32_t yi0 = ssat8_asr14(static_cast<int32_t>(__SMLSD(x0, l0, 8192)));
+        const int32_t yq0 = ssat8_asr14(static_cast<int32_t>(__SMLADX(x0, l0, 8192)));
+        const int32_t yi1 = ssat8_asr14(static_cast<int32_t>(__SMLSD(x1, l1, 8192)));
+        const int32_t yq1 = ssat8_asr14(static_cast<int32_t>(__SMLADX(x1, l1, 8192)));
+        w[k] = __PKHBT((static_cast<uint32_t>(yi0) & 0xFFu) | (static_cast<uint32_t>(yq0) << 8),
+                       (static_cast<uint32_t>(yi1) & 0xFFu) | (static_cast<uint32_t>(yq1) << 8), 16);
+    }
+    nco_phase_ = ph;
+}
+
+void LoRaProcessor::on_message(const Message* const message) {
+    if (message->id == Message::ID::LoRaConfigure)
+        configure(*reinterpret_cast<const LoRaConfigureMessage*>(message));
+    else if (message->id == Message::ID::AudioBeep) {
+        const auto& b = *reinterpret_cast<const AudioBeepMessage*>(message);
+        audio::dma::beep_start(b.freq, b.sample_rate, b.duration_ms);
+    }
+}
+
+void LoRaProcessor::configure(const LoRaConfigureMessage& msg) {
+    aux_on_ = false;
+    aux_.stop();
+    main_.configure(msg.spreading_factor, msg.bandwidth, msg.coding_rate, msg.local_node_id);
+    if (!msg.aux_spreading_factor) return;
+    // The second chain shares the ring, which only has room for two when both stream at
+    // SF <= 8. The application checks the same before asking; this is the backstop.
+    const bool fits = main_.streaming() && main_.symbol_samples() <= 256u &&
+                      msg.aux_spreading_factor >= 7 && msg.aux_spreading_factor <= 8 &&
+                      (msg.aux_bandwidth == 62500 || msg.aux_bandwidth == 125000 || msg.aux_bandwidth == 250000);
+    // Within the 1.75 MHz baseband filter, with the channel's own width to spare.
+    const int32_t off = msg.aux_offset_hz;
+    const bool in_band = (off > -1100000 && off < 300000);
+    if (!fits || !in_band) return;
+    aux_.configure(msg.aux_spreading_factor, msg.aux_bandwidth, msg.aux_coding_rate, 0);
+    aux_.set_preamble(32);  // MeshCore at SF <= 8 (RadioLibWrapper::preambleLengthForSF)
+    // Shift the second channel onto the spot the first one occupies (+fs/4 in the raw
+    // stream, where the decimator's own quarter-rate shift expects it).
+    // -off * 2^32 / fs, truncated toward zero like the 64-bit division it replaces (which
+    // brought a 700-byte library routine into an image that has to fit 32 KiB). With fs =
+    // 2 MHz that is |off| * 2^25 / 15625, taken in exact 32-bit steps for |off| < 1.1 MHz.
+    static_assert(baseband_fs == 2000000, "NCO step arithmetic assumes 2 MS/s");
+    const uint32_t a = static_cast<uint32_t>(off < 0 ? -off : off);
+    const uint32_t t = (a % 15625u) << 13;
+    const uint32_t mag = ((a / 15625u) << 25) + ((t / 15625u) << 12) + (((t % 15625u) << 12) / 15625u);
+    nco_step_ = (off > 0) ? 0u - mag : mag;
+    nco_phase_ = 0;
+    aux_on_ = aux_.streaming();
 }
 
 int main() {

@@ -603,6 +603,10 @@ void set_lora_config(uint8_t spreading_factor, uint32_t bandwidth_hz, uint8_t co
     send_message(&message);
 }
 
+void set_lora_config(LoRaConfigureMessage message) {
+    send_message(&message);
+}
+
 void send_lora_packet(const uint8_t* data, size_t len) {
     LoRaPacketMessage message{};
     message.length = static_cast<uint8_t>(std::min(len, LoRaPacketMessage::MAX_DATA));

@@ -27,7 +27,8 @@
 // LoRa CSS transmitter.
 // Full encode chain: whiten -> Hamming(CR) -> diagonal interleave -> Gray encode -> CSS chirp.
 // Frame: preamble (8 up) + sync word + SFD (2 down) + header (8 syms, CR4/8) + payload symbols.
-// Meshtastic sync word = 0x2B: upchirps at chips 0x2 << 3 = 16 and 0xB << 3 = 88.
+// Meshtastic sync word = 0x2B: upchirps at chips 0x2 << 3 = 16 and 0xB << 3 = 88;
+// MeshCore 0x12: 8 and 16 (set per frame through LoRaConfigureMessage).
 // The shift is a fixed 3 at every spreading factor, which is what Semtech's radios
 // and gr-lora_sdr do. Shifting by (SF-4) instead lands on 16 and 88 only at SF7, so
 // a hardware SX126x accepted our SF7 frames and rejected every other preset on the
@@ -46,6 +47,10 @@ class LoRaTXProcessor : public BasebandProcessor {
     uint8_t coding_rate{5};          // denominator: 5=CR4/5 ... 8=CR4/8
     uint32_t chips_per_symbol{128};  // 2^SF
     bool use_ldro_{false};           // SF>=11: cpb = SF-2
+    // Meshtastic 0x2B / 16 upchirps; MeshCore 0x12 / 32 (16 above SF8). Only the frame
+    // builder reads these - the per-sample loop never sees them.
+    uint8_t sync_word_{0x2B};
+    uint8_t preamble_len_{16};
 
     // Derived timing
     uint32_t samples_per_chip_{20};   // TX_FS / bandwidth

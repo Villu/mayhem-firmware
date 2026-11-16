@@ -2028,6 +2028,17 @@ class LoRaConfigureMessage : public Message {
     // destination field, and must accept unicast frames addressed to us (direct
     // messages, ACKs) besides broadcasts. 0 = broadcast only.
     uint32_t local_node_id;
+    // Transmitter only: the LoRa sync word and preamble length. Meshtastic is 0x2B / 16,
+    // MeshCore 0x12 / 32 (16 above SF8).
+    uint8_t sync_word{0x2B};
+    uint8_t preamble_len{16};
+    // Receiver only: a second network heard at the same time (MeshCore), on its own
+    // frequency, aux_offset_hz from the main channel. 0 = none. Frames it decodes arrive
+    // with LoRaPacketMessage::net = 1.
+    uint8_t aux_spreading_factor{0};
+    uint8_t aux_coding_rate{8};
+    uint32_t aux_bandwidth{0};
+    int32_t aux_offset_hz{0};
 };
 
 // LoRa decoded packet message (M4 → M0)
@@ -2052,6 +2063,9 @@ class LoRaPacketMessage : public Message {
     static constexpr uint8_t CRC_OK{1};
     static constexpr uint8_t CRC_BAD{2};
     uint8_t crc_state{CRC_UNCHECKED};
+    // Which receive chain decoded it: 0 = the main network (Meshtastic), 1 = the second
+    // one (MeshCore). Unused when the message carries a packet to transmit.
+    uint8_t net{0};
     uint8_t data[MAX_DATA]{};
 };
 
