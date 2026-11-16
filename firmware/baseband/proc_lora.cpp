@@ -269,7 +269,18 @@ void LoRaRxChain::process_sym_block() {
 
     uint16_t cw[12] = {};
     lora::deinterleave(sym_block_.data(), cpb, cr, cw);
-    for (int i = 0; i < cpb; i++) feed_nibble(lora::hamming_top4(cw[i], cr));
+    // MeshCore sends CR 4/8, and there the parity is worth using: the code's distance is
+    // four, and hamming_correct84 flips a data bit only on one of the four weight-3
+    // syndromes, which two errors can never produce (theirs have even weight). So a
+    // single wrong bit per code word - what one wrong symbol leaves in a block - is put
+    // right, and a double one is left as it came, as before. Without this a MeshCore
+    // packet failed its CRC on any one off-by-one symbol: a T-Deck's 53-byte messages
+    // arrived "crc bad" with four bytes each one bit wrong, all in a single block
+    // (2026-11-16). The shorter codes cannot correct safely (see hamming_top4), and the
+    // Meshtastic chain keeps its proven path.
+    const bool correct = (gate_ != Gate::Meshtastic && cr == 8);
+    for (int i = 0; i < cpb; i++)
+        feed_nibble(correct ? lora::hamming_correct84(static_cast<uint8_t>(cw[i])) : lora::hamming_top4(cw[i], cr));
 }
 
 // --- Main symbol window processor -------------------------------------------
@@ -1438,7 +1449,9 @@ void LoRaRxChain::sf11_search_begin() {
     srch_best_bad_ = 0xFF;
     srch_best_hs_ = -1;
     srch_best_off_ = 0;
-    sf11_search_step();
+    // Begun late in a buffer (straight after a demod step), the first slice waits for the
+    // next one, which resumes it before any other work of the chain.
+    if (dwt_cycles() - g_buf_t0 < SEARCH_DEADLINE_CYCLES) sf11_search_step();
 }
 
 void LoRaRxChain::sf11_search_step() {
