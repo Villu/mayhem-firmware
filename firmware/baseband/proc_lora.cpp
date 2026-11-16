@@ -1444,6 +1444,17 @@ bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off
     const uint8_t len = decode_header();  // sets header_valid_ + hdr_extra_*
     if (!header_valid_ || len < 4 || len > MAX_PAYLOAD) return false;
     payload_len_target_ = len;
+    // How many payload symbols to wait for before giving the frame up. Meshtastic keeps
+    // the fixed limit it has always had. A MeshCore frame at CR 4/8 passes that limit at
+    // about 108 bytes - an advert with a name is longer - so there the header's own
+    // length decides: two nibbles a byte, the CRC included, in blocks of rx_cw_len_
+    // symbols, and one block to spare.
+    sf11_pay_need_ = PAYLOAD_SYM_LIMIT;
+    if (gate_ != Gate::Meshtastic) {
+        const uint32_t per_block = use_ldro_ ? spreading_factor - 2u : spreading_factor;
+        const uint32_t nibbles = 2u * (len + (hdr_has_crc_ ? 2u : 0u));
+        sf11_pay_need_ = static_cast<uint16_t>(((nibbles + per_block - 1u) / per_block + 1u) * rx_cw_len_);
+    }
     erase_mask_ = 0;
     sharp_ref_ = (sf11_res_bestsh_ > 0.0f) ? sf11_res_bestsh_ : 0.0f;
     sym_in_block_ = 0;
@@ -1927,7 +1938,7 @@ void LoRaRxChain::sf11_consume() {
                 return;
             }
         }
-        if (++sf11_pay_have_ >= PAYLOAD_SYM_LIMIT) {
+        if (++sf11_pay_have_ >= sf11_pay_need_) {
             send_truncated(4);
             sf11_reset();
         }
