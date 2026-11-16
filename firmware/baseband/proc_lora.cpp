@@ -92,8 +92,10 @@ struct LoRaDiag {
     uint32_t last_cands[2];         // candidates decoded to >= 4 bytes / plausible, last search
     uint32_t search_slices;         // sliced MeshCore search calls (a slice per buffer)
     uint32_t whole_max_cycles;      // largest whole execute() since the baseband started
+    uint32_t bad_info;              // last CRC-bad MeshCore frame: len | buffers missed since FINE << 8 | count << 16
+    uint8_t bad_frame[64];          // ...and its bytes
 };
-volatile LoRaDiag g_lora_diag __attribute__((used)) = {0x44494147u, {}, 0, 0, {}, {}, {}, 0, 0};
+volatile LoRaDiag g_lora_diag __attribute__((used)) = {0x44494147u, {}, 0, 0, {}, {}, {}, 0, 0, 0, {}};
 #define DIAG(k) (g_lora_diag.c[net_ & 1][k] = g_lora_diag.c[net_ & 1][k] + 1)
 #else
 #define DIAG(k) ((void)0)
@@ -113,7 +115,7 @@ static inline uint32_t dwt_cycles() {
 // A buffer is due every 208,896 cycles (2048 samples at 2 MS/s, 204 MHz). A search slice
 // starts no new candidate after this point: one candidate is a few thousand cycles and
 // little else runs after the search in the same buffer.
-static constexpr uint32_t SEARCH_DEADLINE_CYCLES = 170000u;
+static constexpr uint32_t SEARCH_DEADLINE_CYCLES = 150000u;
 
 // --- Standalone radix-2 in-place FFT (no dsp_fft.hpp size limit) -------------
 // n must be a power of two. Operates on complex<float> array of exactly n elements.
@@ -806,7 +808,17 @@ void LoRaRxChain::send_packet(const uint8_t* data, size_t len) {
     msg.crc_state = crc_state_;
     DIAG(9);
     if (crc_state_ == LoRaPacketMessage::CRC_OK) DIAG(10);
-    if (crc_state_ == LoRaPacketMessage::CRC_BAD) DIAG(11);
+    if (crc_state_ == LoRaPacketMessage::CRC_BAD) {
+        DIAG(11);
+#if LORA_DIAG
+        if (net_ == 1) {
+            const size_t n = len < 64 ? len : 64;
+            for (size_t i = 0; i < n; i++) g_lora_diag.bad_frame[i] = data[i];
+            const uint32_t miss = (shared_memory.m4_buffer_missed - sf11_miss0_) & 0xFF;
+            g_lora_diag.bad_info = (uint32_t)n | (miss << 8) | ((g_lora_diag.c[1][11] & 0xFFFF) << 16);
+        }
+#endif
+    }
     msg.net = net_;
     for (size_t i = 0; i < msg.length; i++) msg.data[i] = data[i];
     // Approximate RSSI (dBm) from the packet's peak dechirp power. ref_peak_mag_
