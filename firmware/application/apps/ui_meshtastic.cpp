@@ -7568,8 +7568,16 @@ void MeshtasticView::on_timer() {
             const NodeEntry* e = node_db_.at(i);
             if (!e || !e->active) continue;
             sig = sig * 31u + e->node_id + (e->has_pubkey ? 1u : 0u) +
-                  (e->dm_thread ? 2u : 0u) + (e->colour * 4u) +
-                  static_cast<uint32_t>(strlen(e->long_name));
+                  (e->dm_thread ? 2u : 0u) + (e->colour * 4u);
+            // The name and the key themselves, not only that they are there. Counting
+            // just the name's length meant a record once saved wrong stayed wrong: the
+            // node's next NodeInfo corrected it in memory, nothing here noticed, and
+            // every restart brought the bad copy back - with a key one bit off, so no
+            // direct message to that node could be opened until it announced itself.
+            for (const char* p = e->long_name; *p; p++) sig = sig * 31u + static_cast<uint8_t>(*p);
+            for (const char* p = e->short_name; *p; p++) sig = sig * 31u + static_cast<uint8_t>(*p);
+            if (e->has_pubkey)
+                for (int k = 0; k < 32; k++) sig = sig * 31u + e->public_key[k];
         }
         if (sig != threads_sig_) {
             threads_sig_ = sig;
