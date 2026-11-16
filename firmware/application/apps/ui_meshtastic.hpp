@@ -1532,7 +1532,7 @@ class MeshtasticNodesView : public View {
     void toggle_sort(Sort key);
     void cycle_sort();  // the button: next direction, then the next column
     void update_sort_caption();
-    void move_selection(int delta);
+    bool move_selection(int delta);
     void open_selected();
 
    public:
