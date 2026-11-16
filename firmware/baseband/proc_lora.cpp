@@ -75,6 +75,28 @@ static inline void prof_add(int k, uint32_t c) {
 #include <algorithm>
 #include <complex>
 
+// DEBUG ONLY (branch mc-rx-diag): how far each chain gets with every frame, read over the
+// serial shell with tools/lora_diag.py. c[chain][k], chain 0 = Meshtastic, 1 = MeshCore:
+// 0 sharp-run starts, 1 preamble confirmed, 2 SFD found, 3 SFD wait expired, 4 header
+// search run, 5 header committed, 6 no plausible candidate, 7 best candidate too damaged,
+// 8 committed header invalid, 9 frames sent, 10 CRC ok, 11 CRC bad.
+#define LORA_DIAG 1
+#if LORA_DIAG
+struct LoRaDiag {
+    uint32_t magic;
+    uint32_t c[2][12];
+    uint32_t main_max_cycles;       // largest main-chain execute() since the baseband started
+    uint32_t aux_dropped;           // buffers the MeshCore chain gave to Meshtastic
+    uint32_t last_hdr[2];           // first 4 bytes of the nearest header candidate, last search
+    uint32_t last_bad[2];           // fewest parity failures of the last search (0xFF = none)
+    uint32_t last_cands[2];         // candidates decoded to >= 4 bytes / plausible, last search
+};
+volatile LoRaDiag g_lora_diag __attribute__((used)) = {0x44494147u, {}, 0, 0, {}, {}, {}};
+#define DIAG(k) (g_lora_diag.c[net_ & 1][k] = g_lora_diag.c[net_ & 1][k] + 1)
+#else
+#define DIAG(k) ((void)0)
+#endif
+
 // --- Standalone radix-2 in-place FFT (no dsp_fft.hpp size limit) -------------
 // n must be a power of two. Operates on complex<float> array of exactly n elements.
 static void lora_fft_inplace(std::complex<float>* data, size_t n) {
@@ -764,6 +786,9 @@ void LoRaRxChain::send_packet(const uint8_t* data, size_t len) {
     LoRaPacketMessage msg{};
     msg.length = static_cast<uint8_t>(std::min(len, sizeof(msg.data)));
     msg.crc_state = crc_state_;
+    DIAG(9);
+    if (crc_state_ == LoRaPacketMessage::CRC_OK) DIAG(10);
+    if (crc_state_ == LoRaPacketMessage::CRC_BAD) DIAG(11);
     msg.net = net_;
     for (size_t i = 0; i < msg.length; i++) msg.data[i] = data[i];
     // Approximate RSSI (dBm) from the packet's peak dechirp power. ref_peak_mag_
@@ -1289,6 +1314,8 @@ bool LoRaRxChain::sf11_try_decode() {
     g_dbg_bestod = 0;
 #endif
     const bool scored = (gate_ != Gate::Meshtastic);
+    DIAG(4);
+    uint32_t diag_l4 = 0, diag_pl = 0;
     int best_hs = -1, best_da = 0;
     uint32_t best_off = 0;
     uint8_t best_bad = 0xFF;
@@ -1330,10 +1357,18 @@ bool LoRaRxChain::sf11_try_decode() {
                         }
                     }
 #endif
+#if LORA_DIAG
+                    if (rad == 0 && hs == 0 && k == 0)
+                        g_lora_diag.last_hdr[net_ & 1] = (L >= 4) ? (uint32_t)frame[0] | ((uint32_t)frame[1] << 8) |
+                                                                        ((uint32_t)frame[2] << 16) | ((uint32_t)frame[3] << 24)
+                                                              : 0xEEEEEE00u | L;
+#endif
                     if (L < 4) continue;
+                    ++diag_l4;
                     if (!header_plausible(frame, L)) continue;
+                    ++diag_pl;
                     if (!scored) {
-                        if (sf11_commit(B, nb, da, off, hs)) return true;
+                        if (sf11_commit(B, nb, da, off, hs)) { DIAG(5); return true; }
                         continue;
                     }
                     if (cand_parity_bad_ < best_bad) {
@@ -1348,9 +1383,16 @@ bool LoRaRxChain::sf11_try_decode() {
     }
     // One wrong symbol in the block spoils the parity of up to SF code words, so this
     // allows a damaged block through; a misaligned one fails nearly all of them.
-    if (best_hs < 0 || best_bad > spreading_factor / 2) return false;
+#if LORA_DIAG
+    g_lora_diag.last_bad[net_ & 1] = best_bad;
+    g_lora_diag.last_cands[net_ & 1] = (diag_l4 << 16) | (diag_pl & 0xFFFF);
+#endif
+    if (best_hs < 0) { DIAG(6); return false; }
+    if (best_bad > spreading_factor / 2) { DIAG(7); return false; }
     const int16_t* const B = &sf11_bins_[best_da + SF11_DA][best_hs];
-    return sf11_commit(B, static_cast<uint8_t>(sf11_fine_syms_ - best_hs), best_da, best_off, best_hs);
+    if (sf11_commit(B, static_cast<uint8_t>(sf11_fine_syms_ - best_hs), best_da, best_off, best_hs)) { DIAG(5); return true; }
+    DIAG(8);
+    return false;
 }
 
 // The chosen candidate: decode its header into the member chain, replay the payload
@@ -1660,6 +1702,7 @@ void LoRaRxChain::sf11_consume() {
                 sf11_pre_pos_ = sf11_read_;
                 sf11_cfo_acc_ += upk * std::conj(sf11_prev_pk_);
             } else if (sh > sf11_sharp_thr_) {  // first sharp symbol (or a break)
+                DIAG(0);
                 sf11_pre_run_ = 1;
                 sf11_up_bin_ = static_cast<uint32_t>(bin);
                 sf11_pre_pos_ = sf11_read_;
@@ -1697,6 +1740,7 @@ void LoRaRxChain::sf11_consume() {
                 g_dbg_capi = 99;
 #endif
             if (sf11_pre_run_ >= SF11_PRE_MIN) {
+                DIAG(1);
                 sf11_confirmed_ = true;
                 sf11_sfd_step_ = 0;
                 sf11_in_sfd_ = false;
@@ -1722,6 +1766,7 @@ void LoRaRxChain::sf11_consume() {
                 sf11_h0_ = static_cast<uint32_t>((long)sf11_read_ +
                                                  (long)(sf11_sps_ * 9u / 4u) - tau);
                 // Resolve the tau mod-N/2 ambiguity before FINE (see RESOLVE state).
+                DIAG(2);
                 sf11_state_ = Sf11State::RESOLVE;
                 sf11_res_idx_ = 0;
                 sf11_res_bestsh_ = -1.0f;
@@ -1734,7 +1779,10 @@ void LoRaRxChain::sf11_consume() {
 #endif
             } else {
                 sf11_read_ += sf11_sps_;
-                if (sf11_read_ - sf11_pre_pos_ > sfd_wait_syms_ * sf11_sps_) sf11_reset();  // no SFD -> bail
+                if (sf11_read_ - sf11_pre_pos_ > sfd_wait_syms_ * sf11_sps_) {  // no SFD -> bail
+                    DIAG(3);
+                    sf11_reset();
+                }
             }
         }
     } else if (sf11_state_ == Sf11State::RESOLVE) {
@@ -2028,6 +2076,9 @@ void LoRaProcessor::execute(const buffer_c8_t& buffer) {
 #endif
     main_.execute(buffer);  // takes what it needs from the buffer first
     const uint32_t t1 = cycles_now();
+#if LORA_DIAG
+    if (t1 - t0 > g_lora_diag.main_max_cycles) g_lora_diag.main_max_cycles = t1 - t0;
+#endif
 #if LORA_PROF
     prof_add(0, prof_dec_cycles);
     prof_add(1, (t1 - t0) - prof_dec_cycles);
@@ -2039,6 +2090,9 @@ void LoRaProcessor::execute(const buffer_c8_t& buffer) {
             nco_phase_ += nco_step_ * static_cast<uint32_t>(buffer.count);
             aux_.drop_buffer();
             ++aux_dropped_;
+#if LORA_DIAG
+            g_lora_diag.aux_dropped = aux_dropped_;
+#endif
         } else {
             shift_for_aux(buffer);  // ...so the second chain can have it, shifted, in place
 #if LORA_PROF
