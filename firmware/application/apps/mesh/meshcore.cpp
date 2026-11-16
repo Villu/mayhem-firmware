@@ -2,15 +2,32 @@
  * This file is part of PortaPack.
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * MeshCore group chat wire format. See meshcore.hpp.
+ * MeshCore wire format: group chat, adverts, direct messages. See meshcore.hpp.
  */
 
 #include "meshcore.hpp"
-#include "mesh_pki.hpp"  // sha256
+#include "mesh_pki.hpp"  // sha256, Ed25519
 
 #include <cstring>
 
 namespace meshcore {
+
+namespace {
+
+// Everything multi-byte in a MeshCore packet is little-endian.
+uint32_t le32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+void put_le32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+}
+
+}  // namespace
 
 const Preset PRESETS[] = {
     {"EU/UK Narrow", 869618000, 62500, 8, 8},
@@ -64,7 +81,9 @@ struct InvSbox {
 };
 constexpr InvSbox INV_SBOX{};
 
-inline uint8_t xt(uint8_t a) { return static_cast<uint8_t>((a << 1) ^ ((a & 0x80) ? 0x1B : 0)); }
+inline uint8_t xt(uint8_t a) {
+    return static_cast<uint8_t>((a << 1) ^ ((a & 0x80) ? 0x1B : 0));
+}
 
 // GF(2^8) multiply, for InvMixColumns' 9/11/13/14.
 uint8_t gmul(uint8_t a, uint8_t b) {
@@ -156,10 +175,9 @@ void aes128_decrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t o
 
 // ---- HMAC-SHA256 ----------------------------------------------------------------
 // The SHA-256 at hand is one-shot, so the padded key and the message are laid end to
-// end in one buffer. Static rather than on the stack: the receive path that calls this
-// already runs deep on the M0's 4 KB process stack.
-// One scratch buffer for the hash input, shared by everything below: M0 RAM is scarce
-// and none of these run at the same time.
+// end in one buffer. It is static rather than on the stack (the receive path that calls
+// this already runs deep on the M0's 4 KB process stack) and shared by everything below
+// that hashes: M0 RAM is scarce and none of it runs at the same time.
 static uint8_t g_hash_buf[64 + MAX_PACKET];
 
 void hmac_sha256(const uint8_t key[32], const uint8_t* msg, size_t len, uint8_t out[32]) {
@@ -259,10 +277,7 @@ bool parse(const uint8_t* pkt, size_t len, Header& out) {
     size_t i = 1;
     if (out.route == ROUTE_TRANSPORT_FLOOD || out.route == ROUTE_TRANSPORT_DIRECT) {
         if (len < 6) return false;
-        out.has_transport = true;
-        out.transport[0] = static_cast<uint16_t>(pkt[1] | (pkt[2] << 8));
-        out.transport[1] = static_cast<uint16_t>(pkt[3] | (pkt[4] << 8));
-        i = 5;
+        i = 5;  // two 16-bit transport codes, of no use here
     }
     const uint8_t pl = pkt[i++];
     out.hash_size = static_cast<uint8_t>((pl >> 6) + 1);
@@ -286,8 +301,7 @@ uint32_t payload_signature(const Header& h) {
     memcpy(buf + 1, h.payload, n);
     uint8_t d[32];
     meshtastic::pki::sha256(buf, 1 + n, d);
-    return static_cast<uint32_t>(d[0]) | (static_cast<uint32_t>(d[1]) << 8) |
-           (static_cast<uint32_t>(d[2]) << 16) | (static_cast<uint32_t>(d[3]) << 24);
+    return le32(d);
 }
 
 size_t build_group_text(const Channel& ch,
@@ -300,17 +314,14 @@ size_t build_group_text(const Channel& ch,
     // The plain text is laid out where the cipher text will go and encrypted in place.
     if (cap < 5 + MAX_PAYLOAD) return 0;
     uint8_t* const plain = out + 5;
-    size_t n = 0;
-    plain[n++] = static_cast<uint8_t>(timestamp);
-    plain[n++] = static_cast<uint8_t>(timestamp >> 8);
-    plain[n++] = static_cast<uint8_t>(timestamp >> 16);
-    plain[n++] = static_cast<uint8_t>(timestamp >> 24);
-    plain[n++] = 0;  // TXT_TYPE_PLAIN, first attempt
+    put_le32(plain, timestamp);
+    plain[4] = 0;  // TXT_TYPE_PLAIN, first attempt
+    size_t n = 5;
     const size_t slen = sender ? strlen(sender) : 0;
     // createGroupDatagram refuses data_len + 1 + 15 > MAX_PACKET_PAYLOAD: the channel hash
     // byte, the 2-byte MAC and up to 15 bytes of padding have to fit beside it.
     if (n + slen + 2 + text_len + 16 > MAX_PAYLOAD) return 0;
-    memcpy(plain + n, sender, slen);
+    if (slen) memcpy(plain + n, sender, slen);
     n += slen;
     plain[n++] = ':';
     plain[n++] = ' ';
@@ -346,8 +357,7 @@ bool open_group_text(const Channel& ch, const Header& h, GroupText& out) {
     out = GroupText{};
     uint8_t* const plain = reinterpret_cast<uint8_t*>(out.body);
     for (size_t b = 0; b < ct_len; b += 16) aes128_decrypt_block(ch.secret, ct + b, plain + b);
-    out.timestamp = static_cast<uint32_t>(plain[0]) | (static_cast<uint32_t>(plain[1]) << 8) |
-                    (static_cast<uint32_t>(plain[2]) << 16) | (static_cast<uint32_t>(plain[3]) << 24);
+    out.timestamp = le32(plain);
     out.txt_type = plain[4] >> 2;
     out.attempt = plain[4] & 3;
     size_t n = ct_len - 5;
@@ -369,25 +379,24 @@ bool read_advert(const Header& h, AdvertInfo& out) {
     // public key (32) + timestamp (4) + signature (64) + app data
     if (h.type != TYPE_ADVERT || h.payload_len < 101) return false;
     out = AdvertInfo{};
-    out.key_prefix = h.payload[0];
     memcpy(out.pub, h.payload, sizeof(out.pub));
-    out.timestamp = static_cast<uint32_t>(h.payload[32]) | (static_cast<uint32_t>(h.payload[33]) << 8) |
-                    (static_cast<uint32_t>(h.payload[34]) << 16) | (static_cast<uint32_t>(h.payload[35]) << 24);
+    out.timestamp = le32(h.payload + 32);
+    // App data: flags (node type, and which fields follow), then those fields in order.
     const uint8_t* app = h.payload + 100;
     const size_t app_len = h.payload_len - 100;
     const uint8_t flags = app[0];
     out.node_type = flags & 0x0F;
     size_t j = 1;
-    if (flags & 0x10) {
+    if (flags & 0x10) {  // latitude, longitude
         if (j + 8 > app_len) return true;
         out.has_location = true;
-        out.lat_e6 = static_cast<int32_t>(app[j] | (app[j + 1] << 8) | (app[j + 2] << 16) | (static_cast<uint32_t>(app[j + 3]) << 24));
-        out.lon_e6 = static_cast<int32_t>(app[j + 4] | (app[j + 5] << 8) | (app[j + 6] << 16) | (static_cast<uint32_t>(app[j + 7]) << 24));
+        out.lat_e6 = static_cast<int32_t>(le32(app + j));
+        out.lon_e6 = static_cast<int32_t>(le32(app + j + 4));
         j += 8;
     }
-    if (flags & 0x20) j += 2;
+    if (flags & 0x20) j += 2;  // two optional 16-bit "feature" fields, unused so far
     if (flags & 0x40) j += 2;
-    if ((flags & 0x80) && j < app_len) {
+    if ((flags & 0x80) && j < app_len) {  // the name takes the rest
         size_t n = app_len - j;
         if (n > MAX_SENDER_NAME) n = MAX_SENDER_NAME;
         memcpy(out.name, app + j, n);
@@ -510,26 +519,13 @@ size_t open_sealed(const uint8_t secret[32], const uint8_t* in, size_t len) {
     return n;
 }
 
-uint32_t le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-void put_le32(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v);
-    p[1] = static_cast<uint8_t>(v >> 8);
-    p[2] = static_cast<uint8_t>(v >> 16);
-    p[3] = static_cast<uint8_t>(v >> 24);
-}
-
 }  // namespace
 
 bool usable_public_key(const uint8_t pub[32]) {
     return pub[0] != 0x00 && pub[0] != 0xFF;
 }
 
-size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type,
-                    const char* name, uint8_t* out, size_t cap) {
+size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type, const char* name, uint8_t* out, size_t cap) {
     size_t nl = name ? strlen(name) : 0;
     if (nl > MAX_SENDER_NAME) nl = MAX_SENDER_NAME;
     while (nl && (static_cast<uint8_t>(name[nl]) & 0xC0) == 0x80) nl--;  // whole characters only
@@ -542,7 +538,7 @@ size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t times
     put_le32(p + 32, timestamp);
     uint8_t* const app = p + 100;
     app[0] = static_cast<uint8_t>((node_type & 0x0F) | (nl ? 0x80 : 0));  // ADV_NAME_MASK
-    memcpy(app + 1, name, nl);
+    if (nl) memcpy(app + 1, name, nl);
     // Signed: key, timestamp, app data - laid end to end in the scratch buffer.
     uint8_t* const msg = g_plain;
     memcpy(msg, pub, 32);
@@ -566,9 +562,7 @@ uint32_t text_ack(const uint8_t* plain, size_t len, const uint8_t sender_pub[32]
     return le32(d);
 }
 
-size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32],
-                         uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len,
-                         uint8_t* out, size_t cap, uint32_t& expected_ack) {
+size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32], uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len, uint8_t* out, size_t cap, uint32_t& expected_ack) {
     if (text_len > MAX_DIRECT_TEXT) return 0;
     uint8_t* const plain = g_plain;
     put_le32(plain, timestamp);
@@ -603,10 +597,10 @@ bool open_direct_text(const uint8_t secret[32], const uint8_t sender_pub[32], co
     return true;
 }
 
-size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in,
-                      uint32_t ack, uint8_t* out, size_t cap) {
+size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in, uint32_t ack, uint8_t* out, size_t cap) {
     const size_t path_bytes = static_cast<size_t>(came_in.hops) * came_in.hash_size;
-    if (path_bytes + 4 + 5 > 64) return 0;  // MAX_COMBINED_PATH
+    // A path too long to return (MeshCore's MAX_PATH_SIZE is 64) gets a plain ACK instead.
+    if (1 + path_bytes + 1 + 4 > 64) return 0;
     uint8_t* const plain = g_plain;
     size_t n = 0;
     plain[n++] = static_cast<uint8_t>(((came_in.hash_size - 1) << 6) | came_in.hops);
@@ -630,6 +624,12 @@ size_t build_ack(uint32_t ack, uint8_t* out, size_t cap) {
     out[1] = 0;
     put_le32(out + 2, ack);
     return 6;
+}
+
+bool open_ack(const Header& h, uint32_t& ack) {
+    if (h.type != TYPE_ACK || h.payload_len < 4) return false;
+    ack = le32(h.payload);
+    return true;
 }
 
 bool open_path_ack(const uint8_t secret[32], const Header& h, uint32_t& ack) {

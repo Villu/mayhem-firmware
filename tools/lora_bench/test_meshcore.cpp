@@ -1,6 +1,8 @@
-// Host test for the MeshCore group-chat wire format (firmware/application/apps/mesh/meshcore.cpp).
-// Real packets captured off the air by others (michaelhart/meshcore-decoder test suite), so
-// the code is held to what MeshCore nodes actually send, not to a round trip with itself.
+// Host test for the MeshCore wire format (firmware/application/apps/mesh/meshcore.cpp) and the
+// Ed25519 it needs (mesh_pki.cpp). Group texts and adverts are real packets captured off the
+// air by others (michaelhart/meshcore-decoder test suite), and the signing and direct-message
+// vectors come from independent implementations, so the code is held to what MeshCore nodes
+// send and not to a round trip with itself.
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -10,7 +12,25 @@
 
 using namespace meshcore;
 
-#include "test_meshcore_dm.inc"
+// Vectors for the MeshCore direct-message tests, made by independent Python references:
+// pycryptodome Ed25519 (RFC 8032), a pure-Python X25519 over the Edwards->Montgomery map, and
+// pycryptodome AES/HMAC for the packets.
+// prv64, pub, msg, sig  (pycryptodome Ed25519)
+static const char* const ED_VEC[][4] = {
+    {"ae07d5b3fca5b9a80719cf4364790be45193f3bb10b42e2996337f9f0f55c0e499bf23ae8f7af9a93cb7aef7c3245a9d495c39d70f62707af5a6c654ee6cb7c8", "2fa3c670e1fb2f12fb6b3c04a3014dc627f9fb9ec099840cbe13a878ff73e1dd", "", "00d9286174bad530a4b92f85f0a6d010e2ab4fafe25be6f4d18b4e80f5594e44a8151e3fb610e32dd41b8c7fb20c1398f4285abf957bd51f654a90bd117a4203"},
+    {"c71fec4cb829425eeac19e36f42336b821581dea964d9dbf241f03f8413842bf333defdf6b85cf7646d30aa0ce8f17fa3c84b05e2d8a173c46b8000125e984fb", "8fd73e9631a5a47e4533a6cf3ccd708255d1c80e20ead0e41dd3bb5ca7d9fd1a", "a0aeb3fee9232f8af2211f9ee491c5b10becb5563bfc1e6f93427ecbc8fe2955e5cd8e46dc8ed4b7c2764d2a5a4d767706f85d8690024ad6bda3401be9c8cbccc935f6cd1f61226ae15338ae1a34004d33ba0d246ac04c81b1baf23e3bf9eef5f79f2b4934af87f5520b69b94b0d982e85bb55b672a872637acd7466fcb60e0e", "8587a75908ec7d84ba418a809116516f03ff17b45c293b147b1b68307a7ea9c7e75ef5c32cf425a827c84d01627a9a62728d26367309544b4afcf835907e210a"}};
+// shared secret (pure-Python X25519 of the Montgomery-mapped key), both sides agree
+struct KeVec { int a, b; const char* shared; };
+static const KeVec KE_VEC[] = {{0, 1, "99a65215c44d9cb80f55d639501dc5fc5f27438c03e81dbb6bb27da12da5f857"}};
+static const char* const DM_PRV_A = "672fc227c7fd83f9d88ddfa001ca4c5e0fd5eaa56eef4b930a658c404265d50c844a261f234a15f27114b357ae07686b213492df779d02b8dabd664a42bffc27";
+static const char* const DM_PRV_B = "69ac6c88592bd03142545c5bedea87b11fa186d1c30fbc23c3235c5d025bfe820bc8358f24d641b0db5777ab7c18ee7c54c1b3a52bd502f14e89e2ee1ed19285";
+static const char* const DM_ADVERT_A = "11001feb11c08abbe9c2ca45eb912cf6607327e033c3e2d9da42637912f61112b304a0d21969422cd4fbd87c11275bbb73ac75fab69f6f170827c0895fe08b65a247191bb39a4d894737b5adff6e36975d2edcfbb94838f5b02f6804d10603c0f332cf8f4c0981506f7274615061636b";  // ts 1763300000, "PortaPack"
+static const char* const DM_SECRET = "3486e1d5bedf0657bb57209cb348ea286cf1bf510341503bdf9b3cd496433857";
+static const char* const DM_TEXT_AB = "0900961fed247421ab93c8be4cbd6817bc0cc4500f245d9dd89f660ef8e4881cec4bf461027aca66ddb9f565a3e5ac7fb743a9f3b14a";  // ts 1763300005, attempt 1
+static const char* const DM_TEXT_AB_ACK = "ffefe682";
+static const char* const DM_TEXT = "Hello from the PortaPack, a direct message";
+static const char* const DM_PATH_BA = "21001f962bc827bdab8a771b2bdf1787cc36915ae22e";
+static const char* const DM_ACK = "0d00ffefe682";
 
 static std::vector<uint8_t> unhex(const char* s) {
     std::vector<uint8_t> v;
@@ -107,7 +127,7 @@ int main() {
         AdvertInfo a;
         const bool r = parse(pkt.data(), pkt.size(), h) && read_advert(h, a);
         ok &= check(r && a.node_type == 2 && !strcmp(a.name, "WW7STR/PugetMesh Cougar") && a.has_location &&
-                        a.lat_e6 == 47543968 && a.lon_e6 == -122108616 && a.key_prefix == 0x7E,
+                        a.lat_e6 == 47543968 && a.lon_e6 == -122108616,
                     "repeater advert: type, name, location");
         static const uint8_t id[6] = {0x7E, 0x76, 0x62, 0x67, 0x6F, 0x7F};
         ok &= check(r && !memcmp(a.pub, id, 6) && !strcmp(node_type_name(a.node_type), "repeater"),
@@ -204,7 +224,7 @@ int main() {
             ed25519_sign(s2, m.data(), m.size(), u.data(), p.data());
             all &= !memcmp(p2, u.data(), 32) && !memcmp(s2, s.data(), 64);
         }
-        ok &= check(all, "Ed25519: 6 random keys/messages = pycryptodome");
+        ok &= check(all, "Ed25519: random keys, an empty and a long message = pycryptodome");
         all = true;
         for (auto& k : KE_VEC) {
             uint8_t s1[32], s2[32];
@@ -266,7 +286,9 @@ int main() {
         ok &= check(parse(pkt, n, h) && open_path_ack(sec_a, h, got) && got == ack_want, "path + ACK: the sender reads the ACK");
         n = build_ack(ack_want, pkt, sizeof(pkt));
         const auto ak = unhex(DM_ACK);
-        ok &= check(n == ak.size() && !memcmp(pkt, ak.data(), n), "plain ACK: byte-exact");
+        ok &= check(n == ak.size() && !memcmp(pkt, ak.data(), n) && parse(pkt, n, h) && open_ack(h, got) &&
+                        got == ack_want,
+                    "plain ACK: byte-exact, and reads back");
 
         std::string lt(MAX_DIRECT_TEXT, 'x');
         n = build_direct_text(sec_a, pub_b, pub_a, 1, 0, lt.c_str(), lt.size(), pkt, sizeof(pkt), ack);

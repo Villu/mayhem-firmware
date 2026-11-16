@@ -180,6 +180,36 @@ Private messages between nodes that have exchanged public keys are encrypted to 
 keys. A node's public key only travels in its NodeInfo, which stock nodes send every few
 hours, so the app keeps the keys it has learned on the card.
 
+## MeshCore, a second network
+
+[MeshCore](https://github.com/meshcore-dev/MeshCore) is a different LoRa mesh: another
+frequency, sync word, packet format and set of keys. A Meshtastic node and a MeshCore node
+do not hear each other. This app can be on both. It is off until you turn it on under
+**Setup > MeshCore (other network)**, and its settings are kept apart from everything
+Meshtastic (the `mc_` keys in the settings file). Not affiliated with MeshCore.
+
+- **Group chat** on the Public channel and on one more channel of your choice: a `#name`
+  hashtag channel, or a name with its key in hex or base64. In the Chats list they are
+  `MeshCore: Public` and `MeshCore: <name>`, and the channel button reads `MC:P` or
+  `MC:2`. Your own message turns green when a repeater is heard sending it on.
+- **Nodes.** Adverts fill a list of up to eight MeshCore nodes at the end of the Nodes
+  tab, under their own heading.
+- **Direct messages** with companions (people's nodes): `Message (encrypted)` on the
+  node's page. The delivery dot, the retries and the Chats list work as they do for a
+  Meshtastic private message. The other side needs your advert before it can answer; it
+  goes out before your first message, or from `Send advert now` on the MeshCore page.
+
+Hearing both networks at once takes a second demodulator on the same capture. That fits
+only when both use SF7 or SF8 at 250 kHz or narrower, and the MeshCore channel lies
+between 1.1 MHz below and 0.3 MHz above the Meshtastic one - the European narrow settings
+of the two, for example. Otherwise the page says `Send only` and MeshCore is transmitted
+but not heard. Meshtastic comes first: while one of its packets is arriving, MeshCore is
+not listened to.
+
+The PortaPack is an end node there: it does not repeat MeshCore packets, cannot log in
+to repeaters or room servers, and always floods its own messages. Adverts are taken
+without checking their signature.
+
 ## Other alphabets
 
 The firmware font carries ASCII and Latin-1, and the flash is full, so anything else
@@ -224,6 +254,9 @@ composed on the device.
 | `/LOGS/mesh_c<N>.txt` | chat history, one file per channel |
 | `/LOGS/mesh_d<nodeid>.txt` | one per private thread |
 | `/LOGS/mesh_dms.txt` | known nodes, names and public keys |
+| `/LOGS/mesh_mc0.txt`, `mesh_mc1.txt` | MeshCore chat history: Public, the second channel |
+| `/LOGS/mesh_k<key>.txt` | one per MeshCore private thread |
+| `/LOGS/mesh_mcn.txt` | MeshCore nodes heard, with their public keys |
 | `/LOGS/mesh_rx.csv` | packet log, when enabled in Settings → Chat |
 
 The packet log is one row per received frame, from the plaintext header — so packets on
@@ -325,6 +358,8 @@ node list is fixed at ten for the same reason.
   not be served and what was free.
 - **Uncalibrated signal readings.** RSSI is monotone and comparable between nodes but not
   in real dBm, and it saturates when the other node is on the same desk.
+- **MeshCore beside Meshtastic** needs both on SF7/SF8 and close in frequency, and costs
+  about a kilobyte of the memory margin above - see its section.
 - **Half duplex.** Transmitting unloads the receiver, so the app holds off transmitting
   while a packet is arriving.
 

@@ -40,7 +40,7 @@ class LoRaRxChain {
    public:
     // What a candidate frame header has to look like before the chain commits to it.
     // Meshtastic: the first four bytes are the destination (broadcast or us). MeshCore:
-    // a version-1 header byte and a path that fits the frame.
+    // a header byte of version 0 with a known type, and a path that fits the frame.
     enum class Gate : uint8_t { Meshtastic,
                                 MeshCore };
 
@@ -61,7 +61,10 @@ class LoRaRxChain {
         gate_ = gate;
         busy_mask_ = busy_mask ? busy_mask : &own_busy_;
     }
-    void stop() { rx_active = false; }
+    void stop() {
+        rx_active = false;
+        set_rx_busy(false);  // whatever it was receiving is over
+    }
     // The processor gave this buffer's time to the other chain: the samples are gone, so
     // whatever this chain was following (a preamble, a packet) is too. Start over.
     void drop_buffer() {
@@ -268,9 +271,9 @@ class LoRaRxChain {
     // active together (SF is fixed per session), so they share the same 54 KiB - RAM
     // stays exactly as before (no OOM).  The float member makes the union 4-aligned,
     // so both views are safe.  See the proc_lora.cpp SF11 section for the algorithm.
-    uint32_t sf11_sps_{2048};                // RUNTIME samples/symbol = 2^SF (<=2048): 128/256/512/1024/2048
-    uint32_t sf11_stages_{11};               // log2(sps) FFT butterfly stages (8/9/10/11)
-    uint32_t sf11_nsteps_{8};                // demod steps = sps/256 = buffers/symbol (1/2/4/8)
+    uint32_t sf11_sps_{2048};   // RUNTIME samples/symbol = 2^SF (<=2048): 128/256/512/1024/2048
+    uint32_t sf11_stages_{11};  // log2(sps) FFT butterfly stages (8/9/10/11)
+    uint32_t sf11_nsteps_{8};   // demod steps = sps/256 = buffers/symbol (1/2/4/8)
     // Rolling sample window.  5 symbols, not 3: FINE consumes exactly one demod per symbol
     // and the budget delivers exactly one, so it has no real-time margin - whenever a job
     // can't start the instant its samples land it slips a buffer, and over FINE's 14 symbols
@@ -495,9 +498,9 @@ class LoRaRxChain {
     void sf11_consume();                        // act on a finished demod
     void sf11_recompute_ref(float cfo_ramp);    // rebuild ref11 = exp(-j(base+cfo*n))
     void sf11_dechirp_chunk(uint32_t part, uint32_t parts);
-    uint8_t sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32_t off, uint8_t* out, uint8_t out_cap);  // bins->frame bytes (self-contained)
-    bool sf11_try_decode();
-    bool sf11_commit(const int16_t* bins, uint8_t nbins, int da, uint32_t off, int hs);                                                                                     // decode all (da,off) from bins -> winner
+    uint8_t sf11_decode_bins(const int16_t* bins, uint8_t nbins, uint32_t off, uint8_t* out, uint8_t out_cap);  // bins->frame bytes (sets only cand_*)
+    bool sf11_try_decode();                                                                                     // decode all (da,off) from bins -> winner
+    bool sf11_commit(const int16_t* bins, uint8_t nbins, int da, uint32_t off, int hs);                         // the winner: header, buffered payload, then stream
     void sf11_reset();
 
     // --- Core DSP ------------------------------------------------------------
@@ -532,16 +535,22 @@ class LoRaRxChain {
     uint8_t net_{0};  // LoRaPacketMessage::net of what this chain delivers
     uint32_t sfd_wait_syms_{24};
     Gate gate_{Gate::Meshtastic};
-    // Header fields of the last sf11_decode_bins() candidate, for the MeshCore gate.
-    uint8_t cand_cr_{0};
+    // What the last sf11_decode_bins() candidate's header said, for the MeshCore gate:
+    // whether it declares a payload CRC, and how many code words of its first payload
+    // block fail their parity (0xFF = no block in the buffer).
     bool cand_crc_{false};
     uint8_t cand_parity_bad_{0xFF};
     bool header_plausible(const uint8_t* frame, uint8_t len) const;
-    // MeshCore's header search scores every candidate, and all of them in one go took the
-    // M4 past a buffer's deadline on top of what two chains already cost: the buffer
-    // missed then shifted every symbol after it, and each packet arrived "crc bad" (seen
-    // with a real MeshCore node, 2026-11-16). So it runs in slices, each stopping short of
-    // the deadline, and resumes with the next buffer until it decides.
+    // MeshCore's header search. It has no four-byte address to check, and the header
+    // block alone does not pin the offset down: it is sent at reduced rate, so a candidate
+    // one bin off still decodes the same header. What does pin it down is the first
+    // payload block's Hamming parity - at a wrong offset nearly every code word fails it.
+    // So every candidate is scored and the one with the fewest failures wins.
+    //
+    // All candidates in one go took the M4 past a buffer's deadline on top of what two
+    // chains already cost; the buffer missed then shifted every symbol after it and each
+    // packet arrived "crc bad". So the search runs in slices, each stopping short of the
+    // deadline, and resumes with the next buffer until it decides.
     void sf11_search_begin();
     void sf11_search_step();
     bool srch_pending_{false};
@@ -550,9 +559,10 @@ class LoRaRxChain {
     int8_t srch_best_hs_{-1};
     uint32_t srch_best_off_{0};
     // Erasures (MeshCore at CR 4/8): payload symbols whose peak came out far less distinct
-    // than this packet's usual ones, marked by position in the current block. Symbol i of
-    // a block carries bit i of every code word, so each mark is one known-unreliable bit
-    // position, and a code word that fails its parity is rebuilt from the other bits.
+    // than this packet's usual ones, marked by position in the current block (bit i =
+    // symbol i). A symbol carries one bit of every code word in its block, so each mark is
+    // one known-unreliable bit position, and a code word that fails its parity is rebuilt
+    // from the other bits (see process_sym_block).
     uint8_t erase_mask_{0};
     float sharp_ref_{0.0f};  // the packet's running payload sharpness
     static constexpr float ERASE_SHARP_FRACTION{0.35f};
@@ -591,7 +601,6 @@ class LoRaProcessor : public BasebandProcessor {
     // main chain has used more than this, the second one sits the buffer out (and drops
     // whatever it was following) rather than make the main chain lose its packet.
     static constexpr uint32_t MAIN_BUDGET_CYCLES{90000};
-    uint32_t aux_dropped_{0};  // buffers the second chain gave up (debug counter)
 
     /* NB: Threads must be the last members. */
     BasebandThread baseband_thread{baseband_fs, this, baseband::Direction::Receive};

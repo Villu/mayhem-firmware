@@ -2,11 +2,13 @@
  * This file is part of PortaPack.
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * MeshCore wire format, the part a group chat needs: packet header and path, group
- * channels (key -> hash), and GRP_TXT build / open (AES-128-ECB + 2-byte HMAC-SHA256,
- * "encrypt then MAC"). Written from MeshCore's own sources and docs (src/Packet.h,
- * src/Mesh.cpp, src/Utils.cpp, src/helpers/BaseChatMesh.cpp, docs/packet_format.md,
- * docs/payloads.md) and held to real captured packets in tools/lora_bench/test_meshcore.cpp.
+ * MeshCore wire format, the part a chat needs: packet header and path, group channels
+ * (key -> hash) and their texts, adverts (ours signed, others' read), and direct messages
+ * with their ACKs. Everything encrypted is AES-128-ECB with a 2-byte HMAC-SHA256,
+ * "encrypt then MAC". Written from MeshCore's own sources and docs (src/Packet.h,
+ * src/Mesh.cpp, src/Utils.cpp, src/Identity.cpp, src/helpers/BaseChatMesh.cpp,
+ * docs/packet_format.md, docs/payloads.md) and held to real captured packets and
+ * independent reference vectors in tools/lora_bench/test_meshcore.cpp.
  *
  * MeshCore is a separate network from Meshtastic: other frequency, other sync word,
  * other packet format, other keys. Nothing in here touches the Meshtastic code, and
@@ -24,12 +26,14 @@ namespace meshcore {
 // LoRa sync word every MeshCore radio uses (RADIOLIB_SX126X_SYNC_WORD_PRIVATE), and the
 // preamble length it sends (RadioLibWrapper::preambleLengthForSF).
 constexpr uint8_t SYNC_WORD = 0x12;
-constexpr uint8_t preamble_len(uint8_t sf) { return sf <= 8 ? 32 : 16; }
+constexpr uint8_t preamble_len(uint8_t sf) {
+    return sf <= 8 ? 32 : 16;
+}
 
-constexpr size_t MAX_PACKET = 255;        // MAX_TRANS_UNIT
-constexpr size_t MAX_PAYLOAD = 184;       // MAX_PACKET_PAYLOAD
-constexpr size_t MAX_GROUP_TEXT = 160;    // MAX_TEXT_LEN: what the apps allow per message
-constexpr size_t MAX_SENDER_NAME = 31;    // a node name in an advert
+constexpr size_t MAX_PACKET = 255;      // MAX_TRANS_UNIT
+constexpr size_t MAX_PAYLOAD = 184;     // MAX_PACKET_PAYLOAD
+constexpr size_t MAX_GROUP_TEXT = 160;  // MAX_TEXT_LEN: what the apps allow per message
+constexpr size_t MAX_SENDER_NAME = 31;  // a node name in an advert
 
 enum Route : uint8_t { ROUTE_TRANSPORT_FLOOD = 0,
                        ROUTE_FLOOD = 1,
@@ -88,8 +92,6 @@ struct Header {
     uint8_t route{0};
     uint8_t type{0};
     uint8_t version{0};
-    bool has_transport{false};
-    uint16_t transport[2]{};
     uint8_t hash_size{1};  // bytes per path entry
     uint8_t hops{0};
     const uint8_t* path{nullptr};
@@ -128,15 +130,16 @@ struct GroupText {
 // Checks the channel hash and the MAC, then decrypts. false = not this channel, or damaged.
 bool open_group_text(const Channel& ch, const Header& h, GroupText& out);
 
-// Node name and flags from an advert's app data (signature NOT checked: Ed25519 is
-// more code than a name is worth here).
+// What an advert says about its node. The signature is NOT checked: this code signs but
+// carries no Ed25519 verification (several KB more), so an advert is taken on the
+// strength of the LoRa CRC alone. A direct message is still safe from a forged advert -
+// it only opens with the secret derived from the key it claims to come from.
 struct AdvertInfo {
     uint8_t node_type{0};  // 1 chat, 2 repeater, 3 room, 4 sensor
     bool has_location{false};
     int32_t lat_e6{0}, lon_e6{0};
     char name[MAX_SENDER_NAME + 1]{};
-    uint8_t key_prefix{0};  // first byte of the public key = its hash in paths
-    uint8_t pub[32]{};      // the Ed25519 public key; the first six bytes are how the apps tell nodes apart
+    uint8_t pub[32]{};  // the Ed25519 public key; its first byte is the node's hash in packets
     uint32_t timestamp{0};
 };
 bool read_advert(const Header& h, AdvertInfo& out);
@@ -152,8 +155,7 @@ bool usable_public_key(const uint8_t pub[32]);
 
 // Mesh::createAdvert: public key, timestamp, signature over (key, timestamp, app data),
 // app data (flags = node type | has name, then the name). Flood route. Returns the length.
-size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type,
-                    const char* name, uint8_t* out, size_t cap);
+size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type, const char* name, uint8_t* out, size_t cap);
 
 // The shared secret two identities use for each other (calcSharedSecret).
 bool shared_secret(const uint8_t prv[64], const uint8_t their_pub[32], uint8_t secret[32]);
@@ -165,9 +167,7 @@ uint32_t text_ack(const uint8_t* plain, size_t len, const uint8_t sender_pub[32]
 // BaseChatMesh::composeMsgPacket + Mesh::createDatagram: dest hash, our hash, MAC, then
 // AES-128-ECB of timestamp (4) | attempt (flags 0 = plain text) | text. Flood route.
 // Returns the length (0 = does not fit) and the ACK value the recipient will return.
-size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32],
-                         uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len,
-                         uint8_t* out, size_t cap, uint32_t& expected_ack);
+size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32], uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len, uint8_t* out, size_t cap, uint32_t& expected_ack);
 
 // Peer-to-peer packets (TXT_MSG, PATH, REQ, RESPONSE) start dest hash, source hash, MAC.
 inline bool is_peer_packet(const Header& h) {
@@ -190,10 +190,10 @@ bool open_direct_text(const uint8_t secret[32], const uint8_t sender_pub[32], co
 
 // The answer to a flooded direct text (Mesh::createPathReturn with the ACK as its extra):
 // the path the text came in on and the ACK, encrypted for its sender. Flood route.
-size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in,
-                      uint32_t ack, uint8_t* out, size_t cap);
+size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in, uint32_t ack, uint8_t* out, size_t cap);
 // A plain ACK packet (Mesh::createAck), for a text that came by a direct route. Flood.
 size_t build_ack(uint32_t ack, uint8_t* out, size_t cap);
+bool open_ack(const Header& h, uint32_t& ack);
 // The ACK a PATH packet carries, if it decrypts with this secret and carries one.
 bool open_path_ack(const uint8_t secret[32], const Header& h, uint32_t& ack);
 
