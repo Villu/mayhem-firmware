@@ -370,7 +370,9 @@ bool read_advert(const Header& h, AdvertInfo& out) {
     if (h.type != TYPE_ADVERT || h.payload_len < 101) return false;
     out = AdvertInfo{};
     out.key_prefix = h.payload[0];
-    memcpy(out.id, h.payload, sizeof(out.id));
+    memcpy(out.pub, h.payload, sizeof(out.pub));
+    out.timestamp = static_cast<uint32_t>(h.payload[32]) | (static_cast<uint32_t>(h.payload[33]) << 8) |
+                    (static_cast<uint32_t>(h.payload[34]) << 16) | (static_cast<uint32_t>(h.payload[35]) << 24);
     const uint8_t* app = h.payload + 100;
     const size_t app_len = h.payload_len - 100;
     const uint8_t flags = app[0];
@@ -412,19 +414,28 @@ const char* node_type_name(uint8_t node_type) {
 bool NodeList::update(const AdvertInfo& a, int8_t rssi, int16_t snr_tenths, uint8_t hops, uint32_t now) {
     size_t slot = MAX;
     for (size_t i = 0; i < count_; i++)
-        if (!memcmp(e_[i].id, a.id, sizeof(a.id))) slot = i;
+        if (!memcmp(e_[i].pub, a.pub, sizeof(a.pub))) slot = i;
     const bool is_new = (slot == MAX);
     if (is_new) {
         if (count_ < MAX) {
             slot = count_++;
         } else {
-            slot = 0;  // full: the one heard longest ago gives way
-            for (size_t i = 1; i < MAX; i++)
-                if (e_[i].last_seen < e_[slot].last_seen) slot = i;
+            // Full: the one heard longest ago gives way - but a node we talk to only when
+            // every slot is a conversation, or repeaters' adverts would push out the keys
+            // the threads need.
+            slot = MAX;
+            for (size_t i = 0; i < MAX; i++)
+                if (!e_[i].dm && (slot == MAX || e_[i].last_seen < e_[slot].last_seen)) slot = i;
+            if (slot == MAX) {
+                slot = 0;
+                for (size_t i = 1; i < MAX; i++)
+                    if (e_[i].last_seen < e_[slot].last_seen) slot = i;
+            }
+            e_[slot].dm = false;
         }
     }
     Entry& e = e_[slot];
-    memcpy(e.id, a.id, sizeof(e.id));
+    memcpy(e.pub, a.pub, sizeof(e.pub));
     // An advert without a name keeps the one already known.
     if (a.name[0] || is_new) {
         // Cut to fit on a character boundary: a name is UTF-8, often with an emoji.
@@ -447,6 +458,192 @@ bool NodeList::update(const AdvertInfo& a, int8_t rssi, int16_t snr_tenths, uint
     e.snr_tenths = snr_tenths;
     e.last_seen = now ? now : 1;
     return is_new;
+}
+
+const NodeList::Entry* NodeList::find(uint32_t k4) const {
+    for (size_t i = 0; i < count_; i++)
+        if (key4(e_[i].pub) == k4) return &e_[i];
+    return nullptr;
+}
+
+bool NodeList::mark_dm(uint32_t k4) {
+    for (size_t i = 0; i < count_; i++) {
+        if (key4(e_[i].pub) != k4) continue;
+        const bool was = e_[i].dm;
+        e_[i].dm = true;
+        return !was;
+    }
+    return false;
+}
+
+// ---- Direct messages ----------------------------------------------------------------
+
+namespace {
+
+// The plain text of one peer packet, sealed or opened. Static, like g_hash_buf: M0 stack.
+uint8_t g_plain[MAX_PAYLOAD + 16];
+
+// Utils::encryptThenMAC: AES-128-ECB of the zero-padded data, then a 2-byte HMAC-SHA256
+// (key = the whole 32-byte secret) of the cipher text in front of it. out = MAC + cipher.
+size_t seal(const uint8_t secret[32], const uint8_t* plain, size_t len, uint8_t* out) {
+    const size_t padded = (len + 15) & ~static_cast<size_t>(15);
+    uint8_t* const ct = out + 2;
+    memmove(ct, plain, len);
+    memset(ct + len, 0, padded - len);
+    for (size_t b = 0; b < padded; b += 16) aes128_encrypt_block(secret, ct + b, ct + b);
+    uint8_t mac[32];
+    hmac_sha256(secret, ct, padded, mac);
+    out[0] = mac[0];
+    out[1] = mac[1];
+    return 2 + padded;
+}
+
+// Utils::MACThenDecrypt into g_plain. Returns the plain length (padding included), 0 = bad.
+size_t open_sealed(const uint8_t secret[32], const uint8_t* in, size_t len) {
+    if (len < 2 + 16 || ((len - 2) & 15) || len - 2 > MAX_PAYLOAD) return 0;
+    const uint8_t* const ct = in + 2;
+    const size_t n = len - 2;
+    uint8_t mac[32];
+    hmac_sha256(secret, ct, n, mac);
+    if (mac[0] != in[0] || mac[1] != in[1]) return 0;
+    for (size_t b = 0; b < n; b += 16) aes128_decrypt_block(secret, ct + b, g_plain + b);
+    return n;
+}
+
+uint32_t le32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+void put_le32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+}
+
+}  // namespace
+
+bool usable_public_key(const uint8_t pub[32]) {
+    return pub[0] != 0x00 && pub[0] != 0xFF;
+}
+
+size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type,
+                    const char* name, uint8_t* out, size_t cap) {
+    size_t nl = name ? strlen(name) : 0;
+    if (nl > MAX_SENDER_NAME) nl = MAX_SENDER_NAME;
+    while (nl && (static_cast<uint8_t>(name[nl]) & 0xC0) == 0x80) nl--;  // whole characters only
+    const size_t total = 2 + 32 + 4 + 64 + 1 + nl;
+    if (total > cap) return 0;
+    out[0] = static_cast<uint8_t>((TYPE_ADVERT << 2) | ROUTE_FLOOD);
+    out[1] = 0;
+    uint8_t* const p = out + 2;
+    memcpy(p, pub, 32);
+    put_le32(p + 32, timestamp);
+    uint8_t* const app = p + 100;
+    app[0] = static_cast<uint8_t>((node_type & 0x0F) | (nl ? 0x80 : 0));  // ADV_NAME_MASK
+    memcpy(app + 1, name, nl);
+    // Signed: key, timestamp, app data - laid end to end in the scratch buffer.
+    uint8_t* const msg = g_plain;
+    memcpy(msg, pub, 32);
+    put_le32(msg + 32, timestamp);
+    memcpy(msg + 36, app, 1 + nl);
+    meshtastic::pki::ed25519_sign(p + 36, msg, 36 + 1 + nl, pub, prv);
+    return total;
+}
+
+bool shared_secret(const uint8_t prv[64], const uint8_t their_pub[32], uint8_t secret[32]) {
+    return meshtastic::pki::ed25519_key_exchange(secret, their_pub, prv);
+}
+
+uint32_t text_ack(const uint8_t* plain, size_t len, const uint8_t sender_pub[32]) {
+    uint8_t* const buf = g_hash_buf;
+    if (len > sizeof(g_hash_buf) - 32) len = sizeof(g_hash_buf) - 32;
+    memmove(buf, plain, len);
+    memcpy(buf + len, sender_pub, 32);
+    uint8_t d[32];
+    meshtastic::pki::sha256(buf, len + 32, d);
+    return le32(d);
+}
+
+size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32],
+                         uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len,
+                         uint8_t* out, size_t cap, uint32_t& expected_ack) {
+    if (text_len > MAX_DIRECT_TEXT) return 0;
+    uint8_t* const plain = g_plain;
+    put_le32(plain, timestamp);
+    plain[4] = attempt & 3;  // TXT_TYPE_PLAIN << 2 | attempt
+    memcpy(plain + 5, text, text_len);
+    const size_t n = 5 + text_len;
+    const size_t total = 2 + 2 + 2 + ((n + 15) & ~static_cast<size_t>(15));
+    if (total > cap || total - 2 > MAX_PAYLOAD) return 0;
+    expected_ack = text_ack(plain, n, our_pub);
+    out[0] = static_cast<uint8_t>((TYPE_TXT_MSG << 2) | ROUTE_FLOOD);
+    out[1] = 0;  // no path yet
+    out[2] = their_pub[0];
+    out[3] = our_pub[0];
+    return 4 + seal(secret, plain, n, out + 4);
+}
+
+bool open_direct_text(const uint8_t secret[32], const uint8_t sender_pub[32], const Header& h, DirectText& out) {
+    if (h.type != TYPE_TXT_MSG || h.payload_len < 2 + 2 + 16) return false;
+    const size_t n = open_sealed(secret, h.payload + 2, h.payload_len - 2);
+    if (n < 5) return false;
+    out = DirectText{};
+    uint8_t* const p = g_plain;
+    out.timestamp = le32(p);
+    out.txt_type = p[4] >> 2;
+    out.attempt = p[4] & 3;
+    size_t len = 0;
+    while (5 + len < n && p[5 + len]) len++;  // text ends at the first zero (strlen)
+    out.ack = text_ack(p, 5 + len, sender_pub);
+    p[5 + len] = 0;  // n <= MAX_PAYLOAD, and g_plain has room behind it
+    out.text = reinterpret_cast<const char*>(p + 5);
+    out.text_len = len;
+    return true;
+}
+
+size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in,
+                      uint32_t ack, uint8_t* out, size_t cap) {
+    const size_t path_bytes = static_cast<size_t>(came_in.hops) * came_in.hash_size;
+    if (path_bytes + 4 + 5 > 64) return 0;  // MAX_COMBINED_PATH
+    uint8_t* const plain = g_plain;
+    size_t n = 0;
+    plain[n++] = static_cast<uint8_t>(((came_in.hash_size - 1) << 6) | came_in.hops);
+    memcpy(plain + n, came_in.path, path_bytes);
+    n += path_bytes;
+    plain[n++] = TYPE_ACK;
+    put_le32(plain + n, ack);
+    n += 4;
+    const size_t total = 4 + 2 + ((n + 15) & ~static_cast<size_t>(15));
+    if (total > cap) return 0;
+    out[0] = static_cast<uint8_t>((TYPE_PATH << 2) | ROUTE_FLOOD);
+    out[1] = 0;
+    out[2] = their_hash;
+    out[3] = our_hash;
+    return 4 + seal(secret, plain, n, out + 4);
+}
+
+size_t build_ack(uint32_t ack, uint8_t* out, size_t cap) {
+    if (cap < 6) return 0;
+    out[0] = static_cast<uint8_t>((TYPE_ACK << 2) | ROUTE_FLOOD);
+    out[1] = 0;
+    put_le32(out + 2, ack);
+    return 6;
+}
+
+bool open_path_ack(const uint8_t secret[32], const Header& h, uint32_t& ack) {
+    if (h.type != TYPE_PATH || h.payload_len < 2 + 2 + 16) return false;
+    const size_t n = open_sealed(secret, h.payload + 2, h.payload_len - 2);
+    if (!n) return false;
+    const uint8_t* const p = g_plain;
+    const uint8_t pl = p[0];
+    if ((pl >> 6) == 3) return false;
+    size_t k = 1 + static_cast<size_t>(pl & 0x3F) * ((pl >> 6) + 1);
+    if (k + 1 + 4 > n) return false;
+    if ((p[k] & 0x0F) != TYPE_ACK) return false;
+    ack = le32(p + k + 1);
+    return true;
 }
 
 }  // namespace meshcore

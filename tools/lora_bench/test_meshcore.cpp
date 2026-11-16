@@ -6,8 +6,11 @@
 #include <string>
 #include <vector>
 #include "../../firmware/application/apps/mesh/meshcore.hpp"
+#include "../../firmware/application/apps/mesh/mesh_pki.hpp"
 
 using namespace meshcore;
+
+#include "test_meshcore_dm.inc"
 
 static std::vector<uint8_t> unhex(const char* s) {
     std::vector<uint8_t> v;
@@ -107,7 +110,7 @@ int main() {
                         a.lat_e6 == 47543968 && a.lon_e6 == -122108616 && a.key_prefix == 0x7E,
                     "repeater advert: type, name, location");
         static const uint8_t id[6] = {0x7E, 0x76, 0x62, 0x67, 0x6F, 0x7F};
-        ok &= check(r && !memcmp(a.id, id, 6) && !strcmp(node_type_name(a.node_type), "repeater"),
+        ok &= check(r && !memcmp(a.pub, id, 6) && !strcmp(node_type_name(a.node_type), "repeater"),
                     "advert id = first 6 key bytes");
 
         NodeList list;
@@ -123,14 +126,14 @@ int main() {
                     "node list: repeats update, a nameless advert keeps name and place");
         for (uint8_t i = 1; i <= NodeList::MAX; i++) {  // fill up, then one more
             AdvertInfo o = a;
-            o.id[5] = i;
+            o.pub[5] = i;
             o.name[0] = static_cast<char>('a' + i);
             o.name[1] = 0;
             list.update(o, -100, 0, 0, 1000 + i);
         }
         bool evicted_oldest = list.count() == NodeList::MAX;
         for (size_t i = 0; i < list.count(); i++)
-            if (!memcmp(list.at(i).id, id, 6)) evicted_oldest = false;  // the first one, heard at 300
+            if (!memcmp(list.at(i).pub, id, 6)) evicted_oldest = false;  // the first one, heard at 300
         ok &= check(evicted_oldest, "node list: full, the longest-silent node gives way");
         NodeList cut;
         AdvertInfo u = a;
@@ -172,6 +175,106 @@ int main() {
                         parse_key("8b3387e9c5cdea6ac9e5edbaa115cd7", k) == 0 &&
                         parse_key("izOH6cXN6mrJ5e26oRXN", k) == 0 && parse_key("izOH=cXN6mrJ5e26oRXNcg==", k) == 0,
                     "parse_key: refuses short, odd and malformed text");
+    }
+
+    {  // Ed25519 and the MeshCore shared secret
+        using namespace meshtastic::pki;
+        Sha512 sh;
+        uint8_t d[64];
+        sh.init();
+        sh.update(reinterpret_cast<const uint8_t*>("abc"), 3);
+        sh.final(d);
+        ok &= check(!memcmp(d, unhex("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f").data(), 64),
+                    "SHA-512(\"abc\") = FIPS 180-2 example");
+        const auto seed = unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        uint8_t prv[64], pub[32], sig[64];
+        sh.init();
+        sh.update(seed.data(), 32);
+        sh.final(prv);
+        ed25519_public(pub, prv);
+        ed25519_sign(sig, nullptr, 0, pub, prv);
+        ok &= check(!memcmp(pub, unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a").data(), 32) &&
+                        !memcmp(sig, unhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b").data(), 64),
+                    "Ed25519: RFC 8032 test 1 (key and signature)");
+        bool all = true;
+        for (auto& v : ED_VEC) {
+            const auto p = unhex(v[0]), u = unhex(v[1]), m = unhex(v[2]), s = unhex(v[3]);
+            uint8_t p2[32], s2[64];
+            ed25519_public(p2, p.data());
+            ed25519_sign(s2, m.data(), m.size(), u.data(), p.data());
+            all &= !memcmp(p2, u.data(), 32) && !memcmp(s2, s.data(), 64);
+        }
+        ok &= check(all, "Ed25519: 6 random keys/messages = pycryptodome");
+        all = true;
+        for (auto& k : KE_VEC) {
+            uint8_t s1[32], s2[32];
+            all &= shared_secret(unhex(ED_VEC[k.a][0]).data(), unhex(ED_VEC[k.b][1]).data(), s1);
+            all &= shared_secret(unhex(ED_VEC[k.b][0]).data(), unhex(ED_VEC[k.a][1]).data(), s2);
+            all &= !memcmp(s1, unhex(k.shared).data(), 32) && !memcmp(s2, s1, 32);
+        }
+        ok &= check(all, "shared secret: both sides agree, = Python X25519");
+    }
+
+    {  // Direct messages
+        const auto prv_a = unhex(DM_PRV_A), prv_b = unhex(DM_PRV_B);
+        uint8_t pub_a[32], pub_b[32], sec_a[32], sec_b[32];
+        meshtastic::pki::ed25519_public(pub_a, prv_a.data());
+        meshtastic::pki::ed25519_public(pub_b, prv_b.data());
+        shared_secret(prv_a.data(), pub_b, sec_a);
+        shared_secret(prv_b.data(), pub_a, sec_b);
+        ok &= check(!memcmp(sec_a, unhex(DM_SECRET).data(), 32) && !memcmp(sec_b, sec_a, 32), "DM: shared secret");
+
+        uint8_t pkt[MAX_PACKET];
+        size_t n = build_advert(prv_a.data(), pub_a, 1763300000, NODE_CHAT, "PortaPack", pkt, sizeof(pkt));
+        const auto adv = unhex(DM_ADVERT_A);
+        ok &= check(n == adv.size() && !memcmp(pkt, adv.data(), n), "advert: byte-exact with the Python reference (signed)");
+        Header h;
+        AdvertInfo ai;
+        ok &= check(parse(pkt, n, h) && read_advert(h, ai) && !strcmp(ai.name, "PortaPack") &&
+                        ai.node_type == NODE_CHAT && !memcmp(ai.pub, pub_a, 32) && ai.timestamp == 1763300000,
+                    "advert: reads back (name, type, key, time)");
+
+        uint32_t ack = 0;
+        n = build_direct_text(sec_a, pub_b, pub_a, 1763300005, 1, DM_TEXT, strlen(DM_TEXT), pkt, sizeof(pkt), ack);
+        const auto txt = unhex(DM_TEXT_AB);
+        const auto ack_ref = unhex(DM_TEXT_AB_ACK);
+        const uint32_t ack_want = ack_ref[0] | (ack_ref[1] << 8) | (ack_ref[2] << 16) | (static_cast<uint32_t>(ack_ref[3]) << 24);
+        ok &= check(n == txt.size() && !memcmp(pkt, txt.data(), n) && ack == ack_want,
+                    "DM text: byte-exact with the Python reference, ACK too");
+        static DirectText dt;
+        ok &= check(parse(pkt, n, h) && is_peer_packet(h) && h.payload[0] == pub_b[0] && h.payload[1] == pub_a[0] &&
+                        open_direct_text(sec_b, pub_a, h, dt) && !strcmp(dt.text, DM_TEXT) &&
+                        dt.timestamp == 1763300005 && dt.attempt == 1 && dt.txt_type == 0 && dt.ack == ack_want,
+                    "DM text: the recipient opens it and computes the same ACK");
+        pkt[n - 1] ^= 1;
+        parse(pkt, n, h);
+        ok &= check(!open_direct_text(sec_b, pub_a, h, dt), "DM text: a damaged copy is refused (MAC)");
+        uint8_t other[32];
+        shared_secret(unhex(ED_VEC[0][0]).data(), pub_a, other);
+        pkt[n - 1] ^= 1;
+        parse(pkt, n, h);
+        ok &= check(!open_direct_text(other, pub_a, h, dt), "DM text: another secret does not open it");
+
+        // The recipient answers a text that came over two repeaters with a path + ACK.
+        const uint8_t came[] = {0x09, 0x02, 0x5a, 0xc3, 0x00};
+        Header ci;
+        parse(came, sizeof(came), ci);
+        n = build_path_ack(sec_b, pub_a[0], pub_b[0], ci, ack_want, pkt, sizeof(pkt));
+        const auto pth = unhex(DM_PATH_BA);
+        ok &= check(n == pth.size() && !memcmp(pkt, pth.data(), n), "path + ACK: byte-exact with the Python reference");
+        uint32_t got = 0;
+        ok &= check(parse(pkt, n, h) && open_path_ack(sec_a, h, got) && got == ack_want, "path + ACK: the sender reads the ACK");
+        n = build_ack(ack_want, pkt, sizeof(pkt));
+        const auto ak = unhex(DM_ACK);
+        ok &= check(n == ak.size() && !memcmp(pkt, ak.data(), n), "plain ACK: byte-exact");
+
+        std::string lt(MAX_DIRECT_TEXT, 'x');
+        n = build_direct_text(sec_a, pub_b, pub_a, 1, 0, lt.c_str(), lt.size(), pkt, sizeof(pkt), ack);
+        ok &= check(n > 0 && n <= MAX_PACKET && n - 2 <= MAX_PAYLOAD && parse(pkt, n, h) &&
+                        open_direct_text(sec_b, pub_a, h, dt) && dt.text_len == MAX_DIRECT_TEXT,
+                    "DM text: 160 characters fit and come back whole");
+        ok &= check(!build_direct_text(sec_a, pub_b, pub_a, 1, 0, lt.c_str(), MAX_DIRECT_TEXT + 1, pkt, sizeof(pkt), ack),
+                    "DM text: 161 characters are refused");
     }
 
     printf("\n%s\n", ok ? "ALL PASS" : "SOME FAILED");

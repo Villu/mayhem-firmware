@@ -136,10 +136,66 @@ struct AdvertInfo {
     int32_t lat_e6{0}, lon_e6{0};
     char name[MAX_SENDER_NAME + 1]{};
     uint8_t key_prefix{0};  // first byte of the public key = its hash in paths
-    uint8_t id[6]{};        // first six bytes of the public key: how the apps tell nodes apart
+    uint8_t pub[32]{};      // the Ed25519 public key; the first six bytes are how the apps tell nodes apart
+    uint32_t timestamp{0};
 };
 bool read_advert(const Header& h, AdvertInfo& out);
 const char* node_type_name(uint8_t node_type);  // "companion", "repeater", ...
+
+// ---- Our identity and direct messages -----------------------------------------------
+// A MeshCore identity is an Ed25519 key pair; the private half is kept the way MeshCore
+// keeps and exports it (64 bytes: scalar, then nonce prefix). A node's "hash" in packets
+// is the first byte of its public key; 00 and FF are reserved, so such keys are refused.
+constexpr uint8_t NODE_CHAT = 1;
+constexpr size_t MAX_DIRECT_TEXT = 160;  // MAX_TEXT_LEN
+bool usable_public_key(const uint8_t pub[32]);
+
+// Mesh::createAdvert: public key, timestamp, signature over (key, timestamp, app data),
+// app data (flags = node type | has name, then the name). Flood route. Returns the length.
+size_t build_advert(const uint8_t prv[64], const uint8_t pub[32], uint32_t timestamp, uint8_t node_type,
+                    const char* name, uint8_t* out, size_t cap);
+
+// The shared secret two identities use for each other (calcSharedSecret).
+bool shared_secret(const uint8_t prv[64], const uint8_t their_pub[32], uint8_t secret[32]);
+
+// The four bytes a recipient sends back for a direct text: SHA-256 over the plain text as
+// sent (timestamp, flags byte, text without padding) followed by the SENDER's public key.
+uint32_t text_ack(const uint8_t* plain, size_t len, const uint8_t sender_pub[32]);
+
+// BaseChatMesh::composeMsgPacket + Mesh::createDatagram: dest hash, our hash, MAC, then
+// AES-128-ECB of timestamp (4) | attempt (flags 0 = plain text) | text. Flood route.
+// Returns the length (0 = does not fit) and the ACK value the recipient will return.
+size_t build_direct_text(const uint8_t secret[32], const uint8_t their_pub[32], const uint8_t our_pub[32],
+                         uint32_t timestamp, uint8_t attempt, const char* text, size_t text_len,
+                         uint8_t* out, size_t cap, uint32_t& expected_ack);
+
+// Peer-to-peer packets (TXT_MSG, PATH, REQ, RESPONSE) start dest hash, source hash, MAC.
+inline bool is_peer_packet(const Header& h) {
+    return h.type == TYPE_TXT_MSG || h.type == TYPE_PATH || h.type == TYPE_REQ || h.type == TYPE_RESPONSE;
+}
+
+struct DirectText {
+    uint32_t timestamp{0};
+    uint8_t txt_type{0};  // 0 plain, 1 CLI data, 2 signed plain
+    uint8_t attempt{0};
+    // Zero-terminated, in this module's scratch buffer (no second copy of up to 184 bytes
+    // in M0 RAM): valid until the next call into this module that builds or opens a packet.
+    const char* text{nullptr};
+    size_t text_len{0};
+    uint32_t ack{0};  // what the sender expects back
+};
+// A direct text from the peer whose public key and shared secret are given: false when it
+// is not a text, not for this secret, or damaged.
+bool open_direct_text(const uint8_t secret[32], const uint8_t sender_pub[32], const Header& h, DirectText& out);
+
+// The answer to a flooded direct text (Mesh::createPathReturn with the ACK as its extra):
+// the path the text came in on and the ACK, encrypted for its sender. Flood route.
+size_t build_path_ack(const uint8_t secret[32], uint8_t their_hash, uint8_t our_hash, const Header& came_in,
+                      uint32_t ack, uint8_t* out, size_t cap);
+// A plain ACK packet (Mesh::createAck), for a text that came by a direct route. Flood.
+size_t build_ack(uint32_t ack, uint8_t* out, size_t cap);
+// The ACK a PATH packet carries, if it decrypts with this secret and carries one.
+bool open_path_ack(const uint8_t secret[32], const Header& h, uint32_t& ack);
 
 // The MeshCore nodes heard, from their adverts: a few, kept apart from Meshtastic's node
 // table (other identities, no routing role). Full: the one heard longest ago gives way.
@@ -148,7 +204,7 @@ class NodeList {
     static constexpr size_t MAX = 8;
     static constexpr size_t NAME_LEN = 24;  // a MeshCore name is up to 31; the list shows 14
     struct Entry {
-        uint8_t id[6];
+        uint8_t pub[32];  // the whole key: a direct message needs it
         char name[NAME_LEN + 1];
         uint8_t type;
         uint8_t hops;
@@ -157,11 +213,21 @@ class NodeList {
         int16_t snr_tenths;
         int32_t lat_e6, lon_e6;
         uint32_t last_seen;  // caller's clock (app ticks); 0 = unused slot
+        bool dm;             // we have a direct-message thread with it
     };
     // Record an advert. Returns true when the node is new to the list.
     bool update(const AdvertInfo& a, int8_t rssi, int16_t snr_tenths, uint8_t hops, uint32_t now);
     size_t count() const { return count_; }
     const Entry& at(size_t i) const { return e_[i]; }
+    // The node whose key starts with these four bytes (big-endian, as the UI keys a
+    // conversation), or nullptr.
+    const Entry* find(uint32_t key4) const;
+    // Open a direct-message thread with a node. Returns true when that is news.
+    bool mark_dm(uint32_t key4);
+    static uint32_t key4(const uint8_t pub[32]) {
+        return (static_cast<uint32_t>(pub[0]) << 24) | (static_cast<uint32_t>(pub[1]) << 16) |
+               (static_cast<uint32_t>(pub[2]) << 8) | pub[3];
+    }
 
    private:
     Entry e_[MAX]{};

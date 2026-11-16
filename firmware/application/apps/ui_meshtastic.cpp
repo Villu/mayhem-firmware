@@ -1796,6 +1796,12 @@ MeshtasticChatView::MeshtasticChatView(NavigationView& nav,
     };
 
     button_dest_.on_select = [this](Button&) {
+        // On a MeshCore conversation the button steps through MeshCore contacts: a
+        // Meshtastic node there would send a Meshtastic DM from a MeshCore screen.
+        if (is_mc_channel(channel_idx_) && dest_id_ == BROADCAST_ADDR && on_mc_cycle_) {
+            on_mc_cycle_();
+            return;
+        }
         const size_t total = node_db_.count();
         if (total == 0) {
             set_dest(BROADCAST_ADDR);
@@ -1887,8 +1893,9 @@ void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
     m.status = (radio_mode_ == 1) ? 4 : 1;
     m.sent_tick = now_ticks_;
     // A broadcast never times out to red, and neither does anything
-    // sent while the radio cannot hear an answer.
-    m.expects_ack = unicast && (radio_mode_ != 1);
+    // sent while the radio cannot hear an answer. A MeshCore direct message is a
+    // unicast like a Meshtastic one: its recipient owes us an ACK.
+    m.expects_ack = (unicast || (meshcore && channel_idx_ == MC_DM)) && (radio_mode_ != 1);
     m.channel = channel_idx_;
     messages_.push_back(m);
     console_.set_message_index(messages_.size() - 1);
@@ -1900,8 +1907,8 @@ void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
     messages_.back().hist_offset = save_line(text + stamp_after() + "\n", m.status);
     // Which conversation this line lives in, so its delivery byte can be
     // patched later even if the reader has walked off to another chat.
-    messages_.back().hist_peer = dest;
-    messages_.back().hist_ch = channel_idx_;
+    messages_.back().hist_peer = conv_peer();
+    messages_.back().hist_ch = conv_channel();
     text_count_.set("m:" + to_string_dec_uint(++total_msgs_));
     set_pkt_indicator(true);
     // Hand the built packet up to the owning view to actually key
@@ -1978,7 +1985,8 @@ std::u16string MeshtasticChatView::conversation_path(uint32_t peer, uint8_t chan
     if (peer == BROADCAST_ADDR && channel == MC_CHANNEL) return u"/LOGS/mesh_mc0.txt";
     if (peer == BROADCAST_ADDR && channel == MC_CHANNEL2) return u"/LOGS/mesh_mc1.txt";
     if (peer != BROADCAST_ADDR) {
-        p += u'd';
+        // /LOGS/mesh_k<first 4 key bytes>.txt for a MeshCore thread.
+        p += (channel == MC_DM) ? u'k' : u'd';
         const std::string hex = to_string_hex(peer, 8);
         for (char c : hex) p += static_cast<char16_t>(c);
     } else {
@@ -2042,7 +2050,8 @@ void MeshtasticChatView::patch_saved_marker(const ChatMessage& m, uint8_t marker
     f->write(&b, 1);
 }
 
-void MeshtasticChatView::clear_all_history() {
+void MeshtasticChatView::clear_all_history(const std::vector<uint32_t>& mc_peers) {
+    for (const uint32_t k4 : mc_peers) delete_file(conversation_path(k4, MC_DM));
     // Every path this app can write: one file per channel, one per direct-message peer.
     // No directory scan needed - and none available on a card that may hold thousands
     // of unrelated files.
@@ -2071,8 +2080,67 @@ void MeshtasticChatView::switch_conversation() {
 
 void MeshtasticChatView::set_channel_index(uint8_t idx) {
     if (channel_idx_ == idx) return;
+    const bool was_dm = (channel_idx_ == MC_DM);
     channel_idx_ = idx;
+    if (was_dm) {  // out of a MeshCore thread: the button and padlock were its
+        apply_dest_label();
+        update_padlock();
+    }
     if (dest_id_ == BROADCAST_ADDR) switch_conversation();
+}
+
+void MeshtasticChatView::set_mc_dm(uint32_t key4, const std::string& name) {
+    const bool changed = (channel_idx_ != MC_DM) || (mc_peer_ != key4) || (dest_id_ != BROADCAST_ADDR);
+    mc_peer_ = key4;
+    mc_peer_name_ = name;
+    dest_id_ = BROADCAST_ADDR;
+    dest_node_idx_ = 0;
+    channel_idx_ = MC_DM;
+    apply_dest_label();
+    update_padlock();
+    if (changed) switch_conversation();
+}
+
+// A MeshCore direct message: like a Meshtastic one, shown when its thread is open and
+// otherwise filed in that thread and announced.
+void MeshtasticChatView::on_meshcore_dm(uint32_t key4, const std::string& name, const std::string& text_in,
+                                        int8_t rssi, uint8_t hops) {
+    std::string text = text_in;
+    while (!text.empty() && static_cast<uint8_t>(text.back()) < 0x20) text.pop_back();
+    ChatMessage m;
+    m.from_name = name.empty() ? to_string_hex(key4, 8) : name;
+    m.text = text;
+    m.timestamp = to_string_datetime(rtc_time::now(), HM);
+    m.to_id = BROADCAST_ADDR;
+    m.from_id = BROADCAST_ADDR;  // "Reply" stays on this conversation (0 would aim a Meshtastic DM at node 0)
+    m.rssi = rssi;
+    m.hops = hops;
+    m.channel = MC_DM;
+    m.sent_tick = now_ticks_;
+    if (messages_.size() >= MAX_MESSAGES) messages_.erase(messages_.begin());
+    messages_.push_back(m);
+    const std::string who = (display_.name_mode == 3) ? std::string() : m.from_name;
+    const std::string line = stamp() + who + (who.empty() ? "" : ": ") + text;
+    bool rang = false;
+    if (dest_id_ == BROADCAST_ADDR && channel_idx_ == MC_DM && mc_peer_ == key4) {
+        console_.set_message_index(messages_.size() - 1);
+        console_.take_unicode_flag();
+        console_.take_bell_flag();
+        console_.write(line + "\n");
+        save_line(line + "\n");
+        if (console_.take_unicode_flag() && !console_.has_ext_font())
+            console_.write_tech("* no glyph for some characters\n");
+        rang = console_.take_bell_flag();
+        if (rang && (display_.bell_alert || (beep_flag_ && *beep_flag_)))
+            baseband::request_audio_beep(1500, 24000, 400);
+    } else {
+        save_line_to(conversation_path(key4, MC_DM), line + "\n");
+        console_.write_tech("* new message in MC DM " + m.from_name + "\n");
+    }
+    text_count_.set("m:" + to_string_dec_uint(++total_msgs_));
+    if (!rang && beep_flag_ && *beep_flag_)
+        baseband::request_audio_beep(880, 24000, 80);
+    set_pkt_indicator(false);
 }
 
 void MeshtasticChatView::report_gain() {
@@ -2095,7 +2163,8 @@ void MeshtasticChatView::set_gains(uint8_t lna, uint8_t vga, uint8_t amp) {
 
 void MeshtasticChatView::update_padlock() {
     const NodeEntry* e = (dest_id_ != BROADCAST_ADDR) ? node_db_.find(dest_id_) : nullptr;
-    const bool locked = e ? e->has_pubkey : channel_private_;
+    // A MeshCore thread is always end-to-end encrypted (there is no other kind).
+    const bool locked = e ? e->has_pubkey : (channel_idx_ == MC_DM) ? true : channel_private_;
     if (active_encrypted_ == locked) return;
     active_encrypted_ = locked;
     set_dirty();
@@ -2125,7 +2194,7 @@ uint32_t MeshtasticChatView::tag_at_offset(uint32_t off) const {
     for (const auto& m : messages_) {
         if (!m.outgoing || m.status != 1 || !m.packet_id) continue;
         if (m.hist_offset != off) continue;
-        if (m.hist_peer != dest_id_ || m.hist_ch != channel_idx_) continue;  // another chat
+        if (m.hist_peer != conv_peer() || m.hist_ch != conv_channel()) continue;  // another chat
         return m.packet_id;
     }
     return 0;
@@ -2345,13 +2414,19 @@ void MeshtasticChatView::load_history() {
         // patch that byte at the old place - which is now somebody else's line.
         const uint32_t dropped = static_cast<uint32_t>(begin);
         for (auto& mm : messages_) {
-            if (mm.hist_peer != dest_id_ || mm.hist_ch != channel_idx_) continue;
+            if (mm.hist_peer != conv_peer() || mm.hist_ch != conv_channel()) continue;
             mm.hist_offset = (mm.hist_offset > dropped) ? mm.hist_offset - dropped : 0;
         }
     }
 }
 
 void MeshtasticChatView::apply_dest_label() {
+    if (dest_id_ == BROADCAST_ADDR && channel_idx_ == MC_DM) {
+        // Always end-to-end encrypted, so always the "*" a Meshtastic PKC thread gets.
+        button_dest_.set_text(">*" + (mc_peer_name_.empty() ? to_string_hex(mc_peer_, 8)
+                                                            : utf8_cols(mc_peer_name_, 11)));
+        return;
+    }
     if (dest_id_ == BROADCAST_ADDR) {
         button_dest_.set_text(">All");
         return;
@@ -2643,6 +2718,7 @@ void MeshtasticChatView::on_meshcore_text(uint8_t channel, const std::string& se
     m.text = text;
     m.timestamp = to_string_datetime(rtc_time::now(), HM);
     m.to_id = BROADCAST_ADDR;
+    m.from_id = BROADCAST_ADDR;  // "Reply" stays on this channel (0 would aim a Meshtastic DM at node 0)
     m.rssi = rssi;
     m.hops = hops;
     m.channel = channel;
@@ -3378,7 +3454,8 @@ void MeshtasticNodesView::move_selection(int delta) {
 
 void MeshtasticNodesView::open_selected() {
     if (selected_ > order_.size() && selected_ < total_rows() && mc_nodes_) {  // a MeshCore row
-        nav_.push<MeshCoreNodeView>(mc_nodes_->at(mc_order_[selected_ - order_.size() - 1]), now_ticks_);
+        nav_.push<MeshCoreNodeView>(mc_nodes_->at(mc_order_[selected_ - order_.size() - 1]), now_ticks_,
+                                    on_mc_message_);
         return;
     }
     if (selected_ >= order_.size()) return;  // the MeshCore heading, or nothing
@@ -3468,7 +3545,8 @@ void MeshtasticNodesView::paint(Painter& painter) {
 
     // "12s" / "5m" / "3h" since a node was last heard.
     auto fmt_age = [this](uint32_t seen) -> std::string {
-        if (seen == 0 || now_ticks_ < seen) return "--";
+        // 1 = a MeshCore contact restored from the card, not heard since the start.
+        if (seen <= 1 || now_ticks_ < seen) return "--";
         uint32_t s2 = (now_ticks_ - seen) / 60;  // ~60 Hz ticks -> seconds
         if (s2 < 60) return to_string_dec_uint(s2) + "s";
         if (s2 < 3600) return to_string_dec_uint(s2 / 60) + "m";
@@ -3498,7 +3576,7 @@ void MeshtasticNodesView::paint(Painter& painter) {
             const auto& m = mc_nodes_->at(mc_order_[pos - order_.size() - 1]);
             std::string sig = m.rssi ? to_string_dec_int(m.rssi) : "--";
             sig.resize(4, ' ');
-            painter.draw_string({x0, y}, st, to_string_hex(m.id[0], 2) + to_string_hex(m.id[1], 2));
+            painter.draw_string({x0, y}, st, to_string_hex(m.pub[0], 2) + to_string_hex(m.pub[1], 2));
             draw_utf8({x0 + 5 * 8, y}, utf8_cols(m.name[0] ? std::string(m.name) : std::string("?"), 14),
                       st.foreground, st.background);
             painter.draw_string({x0 + 20 * 8, y}, st, sig + " " + fmt_age(m.last_seen));
@@ -4296,6 +4374,16 @@ void MeshtasticChannelsView::set_meshcore(bool shown, uint8_t open_which, const 
     set_dirty();
 }
 
+void MeshtasticChannelsView::set_meshcore_dms(std::vector<McThread> threads, uint32_t open_key4,
+                                              std::function<void(uint32_t)> on_dm) {
+    mc_threads_ = std::move(threads);
+    mc_open_key4_ = open_key4;
+    on_mc_dm_ = std::move(on_dm);
+    selected_ = row_of_open();
+    if (selected_ >= scroll_offset_ + VISIBLE) scroll_offset_ = selected_ - VISIBLE + 1;
+    set_dirty();
+}
+
 size_t MeshtasticChannelsView::dm_count() const {
     size_t n = 0;
     for (size_t i = 0; i < node_db_.count(); i++) {
@@ -4323,6 +4411,7 @@ size_t MeshtasticChannelsView::row_of_open() const {
             if (info.kind == Row::Dm && info.node == open_dm_) return r;
         } else if (mc_open_) {
             if (info.kind == Row::MeshCore && info.slot + 1 == mc_which_) return r;
+            if (info.kind == Row::McDm && mc_which_ == 3 && info.node == mc_open_key4_) return r;
         } else if (info.kind == Row::Primary) {
             if (*active_ == 0) return r;
         } else if (info.kind == Row::Channel) {
@@ -4361,6 +4450,15 @@ MeshtasticChannelsView::Row MeshtasticChannelsView::row_at(size_t row) const {
         if (seen == row) {
             out.kind = Row::MeshCore;
             out.slot = static_cast<int>(m);  // 0 Public, 1 the second channel
+            return out;
+        }
+        seen++;
+    }
+    for (size_t m = 0; m < mc_dm_rows(); m++) {  // and its private threads
+        if (seen == row) {
+            out.kind = Row::McDm;
+            out.slot = static_cast<int>(m);
+            out.node = mc_threads_[m].key4;
             return out;
         }
         seen++;
@@ -4405,6 +4503,12 @@ void MeshtasticChannelsView::paint(Painter& painter) {
             case Row::MeshCore:
                 t = std::string((!open_dm_ && mc_open_ && mc_which_ == info.slot + 1) ? "> " : "  ") +
                     "MeshCore: " + (info.slot ? mc2_name_ : std::string("Public"));
+                break;
+            case Row::McDm:
+                // Drawn as text, so a name is cut to whole characters; MeshCore threads
+                // are always end-to-end encrypted, hence the [pkc] Meshtastic ones earn.
+                t = std::string((!open_dm_ && mc_open_ && mc_which_ == 3 && mc_open_key4_ == info.node) ? "> " : "  ") +
+                    "MC DM [pkc] " + utf8_cols(mc_threads_[info.slot].name, 15);
                 break;
             case Row::Channel:
                 t = std::string((!open_dm_ && !mc_open_ &&
@@ -4521,6 +4625,10 @@ void MeshtasticChannelsView::open_row(size_t row) {
             if (on_mc_) on_mc_(static_cast<uint8_t>(info.slot + 1));
             nav_.pop();
             break;
+        case Row::McDm:
+            if (on_mc_dm_) on_mc_dm_(info.node);  // owner shows the thread on the Chat tab
+            nav_.pop();
+            break;
     }
 }
 
@@ -4602,7 +4710,7 @@ int MeshtasticChannelsView::target_slot() const {
     // back to the active channel, which is how "switch to it, then Delete" behaves.
     const Row info = row_at(selected_);
     if (info.kind == Row::Channel || info.kind == Row::Empty) return info.slot;
-    if (info.kind == Row::MeshCore) return -1;  // nothing of Meshtastic's to act on
+    if (info.kind == Row::MeshCore || info.kind == Row::McDm) return -1;  // nothing of Meshtastic's to act on
     if (*active_ >= 1 && *active_ <= NUM_CUSTOM) return *active_ - 1;
     return -1;
 }
@@ -4651,10 +4759,19 @@ void MeshtasticChannelsView::randomize_key() {
     set_dirty();
 }
 
-MeshCoreNodeView::MeshCoreNodeView(NavigationView& nav, const meshcore::NodeList::Entry& e, uint32_t now_ticks)
+MeshCoreNodeView::MeshCoreNodeView(NavigationView& nav, const meshcore::NodeList::Entry& e, uint32_t now_ticks,
+                                   std::function<void(uint32_t)> on_message)
     : e_(e), now_ticks_(now_ticks) {
+    // Only a companion (a person's node) reads direct messages; a repeater or a room
+    // server wants a login first, which this app does not do.
+    if (e_.type == meshcore::NODE_CHAT && on_message) add_children({&button_msg_});
     add_children({&button_close_});
     button_close_.on_select = [&nav](Button&) { nav.pop(); };
+    on_message_ = std::move(on_message);
+    button_msg_.on_select = [this, &nav](Button&) {
+        on_message_(meshcore::NodeList::key4(e_.pub));  // owner opens the thread on the Chat tab
+        nav.pop();                                      // last: it destroys this view
+    };
 }
 
 void MeshCoreNodeView::paint(Painter& painter) {
@@ -4681,10 +4798,13 @@ void MeshCoreNodeView::paint(Painter& painter) {
     y += 20;
     line(std::string("Type: ") + meshcore::node_type_name(e_.type));
     std::string id;
-    for (uint8_t b : e_.id) id += to_string_hex(b, 2);
+    for (size_t i = 0; i < 6; i++) id += to_string_hex(e_.pub[i], 2);
     line("Key:  " + id + "..");
     const uint32_t s = (now_ticks_ > e_.last_seen) ? (now_ticks_ - e_.last_seen) / 60 : 0;  // ~60 Hz
-    line("Heard: " + (s < 60 ? to_string_dec_uint(s) + " s" : s < 3600 ? to_string_dec_uint(s / 60) + " min" : to_string_dec_uint(s / 3600) + " h") + " ago");
+    if (e_.last_seen <= 1)
+        line("Heard: not since the start");  // a contact kept on the card
+    else
+        line("Heard: " + (s < 60 ? to_string_dec_uint(s) + " s" : s < 3600 ? to_string_dec_uint(s / 60) + " min" : to_string_dec_uint(s / 3600) + " h") + " ago");
     line("Signal: " + (e_.rssi ? to_string_dec_int(e_.rssi) + " dBm" : std::string("--")) +
          "  SNR " + to_string_decimal(e_.snr_tenths / 10.0f, 1));
     line(e_.hops ? "Hops: " + to_string_dec_uint(e_.hops) : std::string("Heard directly"));
@@ -4695,8 +4815,8 @@ void MeshCoreNodeView::paint(Painter& painter) {
         line("Position: not sent");
     }
     y += 8;
-    line("Another network (MeshCore):", dim);
-    line("no direct messages to it.", dim);
+    line("Another network (MeshCore).", dim);
+    if (e_.type != meshcore::NODE_CHAT) line("Not a companion: no messages.", dim);
 }
 
 MeshtasticQRView::MeshtasticQRView(NavigationView& nav, const std::string& text, std::string line1, std::string line2)
@@ -4841,7 +4961,10 @@ MeshCorePageView::MeshCorePageView(NavigationView& nav, MeshSettings& cfg, MeshS
     : MeshSettingsPage(nav, cfg, hooks) {
     add_children({&labels_, &check_enabled_, &field_preset_, &button_freq_, &field_sf_, &field_bw_,
                   &field_cr_, &button_name_, &button_ch_, &button_key_, &text_note0_, &text_note1_,
-                  &disclaimer_});
+                  &disclaimer_, &button_advert_});
+    button_advert_.on_select = [this](Button&) {
+        if (hooks_.mc_advert) hooks_.mc_advert();
+    };
     check_enabled_.set_value(cfg_.mc.enabled);
     check_enabled_.on_select = [this](Checkbox&, bool v) {
         cfg_.mc.enabled = v;
@@ -5688,6 +5811,7 @@ const SettingDef SETTING_DEFS[] = {
     {"mc_cr"sv, offsetof(MeshSettings, mc.cr), K::U8},
     {"mc_ch"sv, offsetof(MeshSettings, mc.ch_name), K::STR},
     {"mc_key"sv, offsetof(MeshSettings, mc.ch_key), K::STR},
+    {"mc_prv"sv, offsetof(MeshSettings, mc.prv_hex), K::STR},
 };
 }  // namespace
 
@@ -6071,6 +6195,8 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     chat_view_.set_on_mc_tx_request([this](const std::string& text, uint8_t channel) {
         return send_meshcore_text(text, channel);
     });
+    chat_view_.set_on_mc_cycle([this]() { mc_cycle_dest(); });
+    nodes_view_.set_on_mc_message([this](uint32_t key4) { open_mc_dm(key4); });
 
     // Open the telemetry-override config from the Map tab.
     map_view_.set_on_resend_pos([this]() { broadcast_position(); });
@@ -6081,6 +6207,7 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     // Point the chat at a node and show it: used by the node detail's "Message"
     // button and by a DM thread picked from the conversations list.
     auto open_dm = [this](uint32_t id) {
+        close_mc_dm();  // a MeshCore thread gives way to whatever was picked
         chat_view_.set_dest(id);
         tab_view_.set_selected(0);  // Chat tab
     };
@@ -6146,12 +6273,20 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
     auto open_channels = [this, open_dm]() {
         auto* v = nav_.push<MeshtasticChannelsView>(cfg_.preset_idx, cfg_.region_idx, cfg_.freq_slot, active_coding_rate(), cfg_.ch_name, cfg_.ch_key, cfg_.ch_enabled, &cfg_.active_channel, &cfg_.primary_name, node_db_, chat_view_.open_dm(), [this]() { apply_channels(); persist(); }, open_dm, [this]() { return random_channel_key(); });
         v->set_on_bell([this](uint8_t channel, uint32_t node) { send_bell(channel, node); });
-        v->set_meshcore(cfg_.mc.enabled, chat_view_.open_dm() ? 0 : cfg_.mc.open,
+        v->set_meshcore(cfg_.mc.enabled, chat_view_.open_dm() ? 0 : mc_dm_peer_ ? 3 : cfg_.mc.open,
                         mc_second_ok_ ? cfg_.mc.ch_name : std::string(), [this](uint8_t open) {
+            mc_dm_peer_ = 0;  // a channel row (either network's) closes a MeshCore thread
             cfg_.mc.open = open;
             apply_channels();
             persist();
         });
+        std::vector<MeshtasticChannelsView::McThread> threads;
+        if (mc_nodes_)
+            for (size_t i = 0; i < mc_nodes_->count(); i++) {
+                const auto& e = mc_nodes_->at(i);
+                if (e.dm) threads.push_back({meshcore::NodeList::key4(e.pub), e.name[0] ? std::string(e.name) : to_string_hex(meshcore::NodeList::key4(e.pub), 8)});
+            }
+        v->set_meshcore_dms(std::move(threads), mc_dm_peer_, [this](uint32_t key4) { open_mc_dm(key4); });
     };
     chat_view_.set_on_channels(open_channels);
     chat_view_.set_beep_flag(&cfg_.beep_on_rx);
@@ -6170,12 +6305,18 @@ MeshtasticView::MeshtasticView(NavigationView& nav)
         apply_radio_ = true;  // region / preset / frequency: restart the receiver
     };
     hooks_.resend = [this]() { nodeinfo_timer_ = nodeinfo_period() - 60; };
-    hooks_.clear_history = [this]() { chat_view_.clear_all_history(); };
+    hooks_.clear_history = [this]() {
+        std::vector<uint32_t> mc_peers;
+        if (mc_nodes_)
+            for (size_t i = 0; i < mc_nodes_->count(); i++) mc_peers.push_back(meshcore::NodeList::key4(mc_nodes_->at(i).pub));
+        chat_view_.clear_all_history(mc_peers);
+    };
     hooks_.pick_on_map = [this]() { pick_position_on_map(); };
     // Our own contact code, in the same format a node card offers for a peer: scanning
     // it adds us to a phone together with our public key, which is what lets that phone
     // send us an encrypted direct message without anyone typing anything.
     hooks_.send_telemetry = [this]() { broadcast_telemetry(); };
+    hooks_.mc_advert = [this]() { mc_send_advert(true); };
     hooks_.share_me = [this]() {
         share_url_ = meshtastic::contact_share_url(cfg_.node_id, cfg_.node_long_name,
                                                    cfg_.node_short_name, pki_pub_,
@@ -6448,6 +6589,7 @@ uint32_t MeshtasticView::send_meshcore_text(const std::string& text, uint8_t cha
         chat_view_.write_console("* MeshCore is off: Setup > MeshCore\n");
         return 0;
     }
+    if (channel == MeshtasticChatView::MC_DM) return send_meshcore_dm(text);
     const std::string sender = cfg_.mc.name.empty() ? std::string(cfg_.node_long_name) : cfg_.mc.name;
     // What fits beside the sender's name, cut on a character boundary.
     const size_t overhead = 5 + sender.size() + 2 + 16;
@@ -6510,19 +6652,344 @@ void MeshtasticView::on_meshcore_packet(const LoRaPacketMessage* msg) {
     } else if (h.type == meshcore::TYPE_ADVERT) {
         static meshcore::AdvertInfo a;
         if (meshcore::read_advert(h, a)) {
-            if (!mc_nodes_) {
-                mc_nodes_ = std::make_unique<meshcore::NodeList>();
-                nodes_view_.set_meshcore_nodes(mc_nodes_.get());
-            }
+            if (mc_have_id_ && !memcmp(a.pub, mc_pub_, 32)) return;  // our own, flooded back
             // Once per node, like the Meshtastic side: repeaters send their advert again
             // and again, and a line for each would bury the chat.
-            if (mc_nodes_->update(a, msg->rssi, msg->snr_tenths, h.hops, uptime_ticks_))
+            if (mc_list().update(a, msg->rssi, msg->snr_tenths, h.hops, uptime_ticks_)) {
                 chat_view_.write_console(std::string("* new MeshCore ") + meshcore::node_type_name(a.node_type) +
                                          ": " + (a.name[0] ? a.name : "(no name)") + "\n");
+                mc_nodes_dirty_ = true;
+            }
             nodes_view_.refresh();
         }
+    } else if (meshcore::is_peer_packet(h) && h.payload_len >= 4 && (mc_have_id_ || mc_load_identity()) &&
+               h.payload[0] == mc_pub_[0]) {
+        on_meshcore_peer(h, msg);  // addressed to us (by our one-byte hash, at least)
+    } else if (h.type == meshcore::TYPE_ACK && h.payload_len >= 4) {
+        mc_ack_heard(static_cast<uint32_t>(h.payload[0]) | (static_cast<uint32_t>(h.payload[1]) << 8) |
+                     (static_cast<uint32_t>(h.payload[2]) << 16) | (static_cast<uint32_t>(h.payload[3]) << 24));
+    } else if (meshcore::is_peer_packet(h)) {
+        // Somebody else's conversation: nothing to show.
     } else {
         chat_view_.write_console(std::string("* MC ") + meshcore::type_name(h.type) + "\n");
+    }
+}
+
+// ---- MeshCore direct messages ---------------------------------------------------
+
+meshcore::NodeList& MeshtasticView::mc_list() {
+    if (!mc_nodes_) {
+        mc_nodes_ = std::make_unique<meshcore::NodeList>();
+        nodes_view_.set_meshcore_nodes(mc_nodes_.get());
+        load_mc_nodes();  // the contacts kept from earlier sessions
+    }
+    return *mc_nodes_;
+}
+
+bool MeshtasticView::mc_load_identity() {
+    if (mc_have_id_) return true;
+    const std::string& hx = cfg_.mc.prv_hex;
+    if (hx.size() != 128) return false;
+    for (size_t i = 0; i < 64; i++) {
+        const int hi = hex_digit(hx[2 * i]), lo = hex_digit(hx[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        mc_prv_[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    meshtastic::pki::ed25519_public(mc_pub_, mc_prv_);
+    mc_have_id_ = meshcore::usable_public_key(mc_pub_);
+    return mc_have_id_;
+}
+
+bool MeshtasticView::mc_ensure_identity() {
+    if (mc_load_identity()) return true;
+    // Made the first time it is needed, like the Meshtastic key, so the entropy pool has
+    // had received packets stirred into it. The two halves come from two hashes of the
+    // same sources; a key whose first byte is 00 or FF is reserved, so try again.
+    const auto t = rtc_time::now();
+    for (uint32_t round = 0; round < 16 && !mc_have_id_; round++) {
+        uint32_t words[9] = {
+            (static_cast<uint32_t>(t.year()) << 16) ^ (static_cast<uint32_t>(t.month()) << 8) ^ t.day(),
+            (static_cast<uint32_t>(t.hour()) << 16) ^ (static_cast<uint32_t>(t.minute()) << 8) ^ t.second(),
+            uptime_ticks_, cfg_.node_id, entropy_pool_, rand_next(), rand_next(), round, 0};
+        meshtastic::pki::sha256(reinterpret_cast<const uint8_t*>(words), sizeof(words), mc_prv_);
+        words[8] = 1;
+        words[5] ^= rand_next();
+        meshtastic::pki::sha256(reinterpret_cast<const uint8_t*>(words), sizeof(words), mc_prv_ + 32);
+        mc_prv_[0] &= 248;  // stored clamped, as MeshCore stores it
+        mc_prv_[31] = (mc_prv_[31] & 63) | 64;
+        meshtastic::pki::ed25519_public(mc_pub_, mc_prv_);
+        mc_have_id_ = meshcore::usable_public_key(mc_pub_);
+    }
+    if (!mc_have_id_) return false;
+    static const char H[] = "0123456789abcdef";
+    cfg_.mc.prv_hex.clear();
+    cfg_.mc.prv_hex.reserve(128);
+    for (size_t i = 0; i < 64; i++) {
+        cfg_.mc.prv_hex += H[mc_prv_[i] >> 4];
+        cfg_.mc.prv_hex += H[mc_prv_[i] & 0xF];
+    }
+    persist();
+    chat_view_.write_console("* MeshCore identity made: " + to_string_hex(meshcore::NodeList::key4(mc_pub_), 8) + "\n");
+    return true;
+}
+
+void MeshtasticView::mc_send_advert(bool by_user) {
+    if (!cfg_.mc.enabled) {
+        chat_view_.write_console("* MeshCore is off: Setup > MeshCore\n");
+        return;
+    }
+    if (cfg_.radio_mode == 2) {
+        chat_view_.write_console("* receive only: no advert sent\n");
+        return;
+    }
+    if (!mc_ensure_identity()) return;
+    const std::string name = cfg_.mc.name.empty() ? std::string(cfg_.node_long_name) : cfg_.mc.name;
+    uint8_t* const buf = pkt_scratch;
+    const size_t len = meshcore::build_advert(mc_prv_, mc_pub_, now_unix(), meshcore::NODE_CHAT,
+                                              name.empty() ? "PortaPack" : name.c_str(), buf, sizeof(pkt_scratch));
+    if (!len || !queue_tx(buf, len, true, NET_MESHCORE)) {
+        chat_view_.write_console("* MeshCore advert not sent\n");
+        return;
+    }
+    mc_advert_sent_ = true;
+    chat_view_.write_console(std::string(by_user ? "* MeshCore advert sent, key " : "* sent our MeshCore advert first, key ") +
+                             to_string_hex(meshcore::NodeList::key4(mc_pub_), 8) + "\n");
+}
+
+const uint8_t* MeshtasticView::mc_secret_for(const meshcore::NodeList::Entry& e) {
+    const uint32_t k4 = meshcore::NodeList::key4(e.pub);
+    for (const auto& s : mc_secrets_)
+        if (s.key4 == k4 && k4) return s.secret;
+    if (!mc_have_id_) return nullptr;
+    McSecret& s = mc_secrets_[mc_secret_next_];
+    if (!meshcore::shared_secret(mc_prv_, e.pub, s.secret)) return nullptr;
+    s.key4 = k4;
+    mc_secret_next_ = static_cast<uint8_t>((mc_secret_next_ + 1) % 2);
+    return s.secret;
+}
+
+void MeshtasticView::open_mc_dm(uint32_t key4) {
+    const meshcore::NodeList::Entry* e = mc_nodes_ ? mc_nodes_->find(key4) : nullptr;
+    if (!e) return;
+    if (mc_list().mark_dm(key4)) mc_nodes_dirty_ = true;  // a thread, like node_db_.mark_dm
+    mc_dm_peer_ = key4;
+    chat_view_.set_dest(meshtastic::BROADCAST_ADDR, false);
+    apply_channels();
+    tab_view_.set_selected(0);  // Chat tab
+}
+
+void MeshtasticView::close_mc_dm() {
+    if (!mc_dm_peer_) return;
+    mc_dm_peer_ = 0;
+    apply_channels();
+}
+
+// The chat's destination button on a MeshCore conversation: the companions we know, one
+// after another, then back to the channel - the way it walks the Meshtastic nodes.
+void MeshtasticView::mc_cycle_dest() {
+    if (!mc_nodes_) {
+        chat_view_.write_console("* no MeshCore nodes heard yet\n");
+        return;
+    }
+    const auto& list = *mc_nodes_;
+    size_t start = 0;
+    if (mc_dm_peer_) {
+        for (size_t i = 0; i < list.count(); i++)
+            if (meshcore::NodeList::key4(list.at(i).pub) == mc_dm_peer_) start = i + 1;
+    }
+    for (size_t i = start; i < list.count(); i++) {
+        if (list.at(i).type != meshcore::NODE_CHAT) continue;
+        // Stepping past a node does not open a thread with it: only sending does.
+        mc_dm_peer_ = meshcore::NodeList::key4(list.at(i).pub);
+        apply_channels();
+        return;
+    }
+    if (!mc_dm_peer_) {
+        chat_view_.write_console("* no MeshCore companions heard yet\n");
+        return;
+    }
+    close_mc_dm();
+}
+
+uint32_t MeshtasticView::send_meshcore_dm(const std::string& text) {
+    const meshcore::NodeList::Entry* e = mc_nodes_ ? mc_nodes_->find(mc_dm_peer_) : nullptr;
+    if (!e) {
+        chat_view_.write_console("* MeshCore: that node is not known any more\n");
+        return 0;
+    }
+    if (!mc_ensure_identity()) return 0;
+    // The recipient can only answer (and only read us) once it holds our key, and the
+    // advert is where it gets it. Once a session, before the first message.
+    if (!mc_advert_sent_) mc_send_advert(false);
+    const uint8_t* const secret = mc_secret_for(*e);
+    if (!secret) {
+        chat_view_.write_console("* MeshCore: unusable key for that node\n");
+        return 0;
+    }
+    size_t n = std::min(text.size(), meshcore::MAX_DIRECT_TEXT);
+    while (n && n < text.size() && (static_cast<uint8_t>(text[n]) & 0xC0) == 0x80) n--;
+    const uint32_t ts = now_unix();
+    uint32_t ack = 0;
+    uint8_t* const buf = pkt_scratch;
+    const size_t len = meshcore::build_direct_text(secret, e->pub, mc_pub_, ts, 0, text.data(), n, buf,
+                                                   sizeof(pkt_scratch), ack);
+    if (!len || !queue_tx(buf, len, true, NET_MESHCORE)) return 0;
+    if (n < text.size()) chat_view_.write_console("* MeshCore: message cut to fit\n");
+    if (mc_list().mark_dm(mc_dm_peer_)) mc_nodes_dirty_ = true;
+    const uint32_t tag = ack ? ack : 1;
+    mc_acks_[mc_ack_next_] = ack;
+    mc_ack_tags_[mc_ack_next_] = tag;
+    mc_ack_next_ = static_cast<uint8_t>((mc_ack_next_ + 1) % MC_ACKS);
+    // Repeated like a Meshtastic DM, same settings, until the ACK comes back. MeshCore's
+    // attempt field has room for the first send and three more.
+    if (cfg_.radio_mode != 1 && cfg_.chat.tx_retries) {
+        mc_retry_text_.assign(text, 0, n);
+        mc_retry_peer_ = mc_dm_peer_;
+        mc_retry_ts_ = ts;
+        mc_retry_tag_ = tag;
+        mc_retry_attempt_ = 0;
+        mc_retry_left_ = static_cast<uint8_t>(std::min<uint32_t>(cfg_.chat.tx_retries, 3));
+        mc_retry_at_ = uptime_ticks_ + cfg_.chat.tx_retry_s * 60u;
+        chat_view_.set_retry_tag(tag);
+        chat_view_.set_retry("0/" + to_string_dec_uint(mc_retry_left_));
+    }
+    return tag;
+}
+
+void MeshtasticView::mc_ack_heard(uint32_t ack) {
+    for (size_t i = 0; i < MC_ACKS; i++) {
+        if (!mc_ack_tags_[i] || mc_acks_[i] != ack) continue;
+        const uint32_t tag = mc_ack_tags_[i];
+        chat_view_.on_ack(tag, true);  // delivered: green
+        for (size_t j = 0; j < MC_ACKS; j++)  // its other attempts' ACKs are moot now
+            if (mc_ack_tags_[j] == tag) mc_ack_tags_[j] = 0;
+        if (tag == mc_retry_tag_) {
+            mc_retry_tag_ = 0;
+            mc_retry_text_.clear();
+            mc_retry_text_.shrink_to_fit();
+            chat_view_.set_retry({});
+        }
+        return;
+    }
+    chat_view_.write_console("* MC ACK\n");  // somebody else's
+}
+
+void MeshtasticView::on_meshcore_peer(const meshcore::Header& h, const LoRaPacketMessage* msg) {
+    // Only a one-byte hash names the sender, so every node with that first byte is a
+    // candidate, and the MAC says which one it really is.
+    const uint8_t src = h.payload[1];
+    static meshcore::DirectText dt;  // static: this is deep in the receive path
+    const meshcore::NodeList::Entry* from = nullptr;
+    const uint8_t* secret = nullptr;
+    bool is_text = false;
+    uint32_t ack = 0;
+    {
+        mc_list();  // the contacts from the card, if no advert has been heard yet
+        for (size_t i = 0; i < mc_nodes_->count() && !from; i++) {
+            const auto& e = mc_nodes_->at(i);
+            if (e.pub[0] != src) continue;
+            const uint8_t* s = mc_secret_for(e);
+            if (!s) continue;
+            if (h.type == meshcore::TYPE_TXT_MSG && meshcore::open_direct_text(s, e.pub, h, dt)) {
+                from = &e;
+                is_text = true;
+            } else if (h.type == meshcore::TYPE_PATH && meshcore::open_path_ack(s, h, ack)) {
+                from = &e;
+            }
+            if (from) secret = s;
+        }
+    }
+    if (!from) {
+        if (h.type == meshcore::TYPE_TXT_MSG)
+            chat_view_.write_console("* MC DM from unknown node " + to_string_hex(src, 2) + ": no advert heard\n");
+        else if (h.type != meshcore::TYPE_PATH)
+            chat_view_.write_console(std::string("* MC ") + meshcore::type_name(h.type) + " for us\n");
+        return;
+    }
+    if (!is_text) {
+        mc_ack_heard(ack);  // the answer to one of ours, with the path back to its sender
+        return;
+    }
+    const uint32_t k4 = meshcore::NodeList::key4(from->pub);
+    const std::string text(dt.text, dt.text_len);  // out of the scratch buffer the receipt reuses
+    if (dt.txt_type != 0) {  // CLI data or a room server's signed text: not a chat line
+        chat_view_.write_console("* MC DM of type " + to_string_dec_uint(dt.txt_type) + " from " + from->name + "\n");
+        return;
+    }
+    // The receipt: our path back and the ACK when it came flooded (createPathReturn), a
+    // bare ACK when it came by a direct route. Flooded either way: no route is kept.
+    if (cfg_.send_read_receipts && cfg_.radio_mode != 2) {
+        uint8_t* const buf = pkt_scratch;
+        const bool flooded = (h.route == meshcore::ROUTE_FLOOD || h.route == meshcore::ROUTE_TRANSPORT_FLOOD);
+        size_t len = flooded ? meshcore::build_path_ack(secret, from->pub[0], mc_pub_[0], h, dt.ack, buf, sizeof(pkt_scratch))
+                             : 0;
+        if (!len) len = meshcore::build_ack(dt.ack, buf, sizeof(pkt_scratch));
+        if (len) queue_tx(buf, len, true, NET_MESHCORE);
+    }
+    if (mc_list().mark_dm(k4)) mc_nodes_dirty_ = true;
+    // A repeat of a text already shown (our receipt went missing): answered, not shown.
+    for (const auto& d : mc_last_dm_)
+        if (d[0] == k4 && d[1] == dt.timestamp) return;
+    mc_last_dm_[mc_last_dm_next_][0] = k4;
+    mc_last_dm_[mc_last_dm_next_][1] = dt.timestamp;
+    mc_last_dm_next_ = static_cast<uint8_t>((mc_last_dm_next_ + 1) % 4);
+    chat_view_.on_meshcore_dm(k4, from->name, text, msg->rssi, h.hops);
+}
+
+// /LOGS/mesh_mcn.txt: one line per MeshCore node, "key-hex,type,thread,name".
+void MeshtasticView::save_mc_nodes() {
+    if (!mc_nodes_) return;
+    auto f = std::make_unique<File>();
+    if (f->create(u"/LOGS/mesh_mcn.txt").is_valid()) return;
+    for (size_t i = 0; i < mc_nodes_->count(); i++) {
+        const auto& e = mc_nodes_->at(i);
+        std::string line;
+        line.reserve(64 + 8 + sizeof(e.name));
+        for (uint8_t b : e.pub) line += to_string_hex(b, 2);
+        line += "," + to_string_dec_uint(e.type) + (e.dm ? ",1," : ",0,") + e.name + "\n";
+        f->write(line.data(), line.size());
+    }
+}
+
+void MeshtasticView::load_mc_nodes() {
+    if (!mc_nodes_) return;
+    auto f = std::make_unique<File>();
+    if (f->open(u"/LOGS/mesh_mcn.txt").is_valid()) return;
+    const size_t size = f->size();
+    if (!size || size > 1024) return;  // 8 lines of at most ~95 bytes
+    std::string buf(size, '\0');
+    const auto rd = f->read(&buf[0], size);
+    if (!rd) return;
+    buf.resize(*rd);
+    static meshcore::AdvertInfo a;
+    size_t pos = 0;
+    while (pos < buf.size()) {
+        size_t eol = buf.find('\n', pos);
+        if (eol == std::string::npos) eol = buf.size();
+        const size_t start = pos;
+        pos = eol + 1;
+        const size_t c1 = start + 64;
+        if (c1 >= eol || buf[c1] != ',') continue;
+        const size_t c2 = buf.find(',', c1 + 1);
+        if (c2 == std::string::npos || c2 + 1 >= eol) continue;
+        const size_t c3 = buf.find(',', c2 + 1);
+        if (c3 == std::string::npos || c3 > eol) continue;
+        a = meshcore::AdvertInfo{};
+        bool ok = true;
+        for (size_t k = 0; k < 32 && ok; k++) {
+            const int hi = hex_digit(buf[start + 2 * k]), lo = hex_digit(buf[start + 2 * k + 1]);
+            ok = hi >= 0 && lo >= 0;
+            a.pub[k] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+        if (!ok) continue;
+        a.key_prefix = a.pub[0];
+        a.node_type = static_cast<uint8_t>(atoi(buf.c_str() + c1 + 1));
+        const size_t nl = std::min<size_t>(eol - c3 - 1, meshcore::MAX_SENDER_NAME);
+        memcpy(a.name, buf.data() + c3 + 1, nl);
+        a.name[nl] = 0;
+        // last_seen 1: known, but not heard since the start.
+        mc_nodes_->update(a, 0, 0, 0, 1);
+        if (buf[c2 + 1] == '1') mc_nodes_->mark_dm(meshcore::NodeList::key4(a.pub));
     }
 }
 
@@ -6576,6 +7043,10 @@ void MeshtasticView::start_deferred() {
         const char* why = mc_rx_problem();
         chat_view_.write_console(std::string("* MeshCore on, ") + fmt_freq_mhz(mc_frequency()) +
                                  (why ? std::string(": send only, ") + why : std::string(": listening")) + "\n");
+        // Our key (to know a direct message is for us) and the contacts kept on the card
+        // (to read it), ready before the first packet.
+        mc_load_identity();
+        mc_list();
     }
     if (cfg_.logging) {
         logger_ = std::make_unique<MeshtasticLogger>();
@@ -7108,6 +7579,43 @@ void MeshtasticView::on_timer() {
             retry_len_ = 0;
             retry_pid_ = 0;
         }
+    }
+
+    // A MeshCore direct message still without its ACK: built again with the next attempt
+    // number (a repeater would drop an identical copy as already seen), so it also has
+    // a new ACK, and the old ones still count.
+    if (mc_retry_tag_ && uptime_ticks_ >= mc_retry_at_) {
+        const meshcore::NodeList::Entry* e = mc_nodes_ ? mc_nodes_->find(mc_retry_peer_) : nullptr;
+        const uint8_t* secret = e ? mc_secret_for(*e) : nullptr;
+        if (mc_retry_left_ && secret && !tx_pending_) {
+            --mc_retry_left_;
+            ++mc_retry_attempt_;
+            uint32_t ack = 0;
+            uint8_t* const buf = pkt_scratch;
+            const size_t len = meshcore::build_direct_text(secret, e->pub, mc_pub_, mc_retry_ts_, mc_retry_attempt_ & 3,
+                                                           mc_retry_text_.data(), mc_retry_text_.size(), buf,
+                                                           sizeof(pkt_scratch), ack);
+            if (len && queue_tx(buf, len, true, NET_MESHCORE)) {
+                mc_acks_[mc_ack_next_] = ack;
+                mc_ack_tags_[mc_ack_next_] = mc_retry_tag_;
+                mc_ack_next_ = static_cast<uint8_t>((mc_ack_next_ + 1) % MC_ACKS);
+            }
+            mc_retry_at_ = uptime_ticks_ + cfg_.chat.tx_retry_s * 60u;
+            chat_view_.set_retry_tag(mc_retry_tag_);
+            chat_view_.set_retry(to_string_dec_uint(mc_retry_attempt_) + "/" +
+                                 to_string_dec_uint(mc_retry_attempt_ + mc_retry_left_));
+        } else if (!mc_retry_left_ || !secret) {
+            chat_view_.on_retries_done(mc_retry_tag_);  // out of attempts: red
+            chat_view_.set_retry({});
+            mc_retry_tag_ = 0;
+            mc_retry_text_.clear();
+            mc_retry_text_.shrink_to_fit();
+        }
+    }
+    // MeshCore contacts to the card when they changed (a new node, a new thread).
+    if (mc_nodes_dirty_ && (uptime_ticks_ % 300u) == 150u) {
+        mc_nodes_dirty_ = false;
+        save_mc_nodes();
     }
 
     // Second helping of the demodulator configuration after a baseband restart.
@@ -7768,6 +8276,18 @@ void MeshtasticView::apply_channels() {
     chat_view_.set_encrypted(cfg_.active_channel != 0 &&
                              !cfg_.ch_key[cfg_.active_channel - 1].empty());
     apply_meshcore_channels();
+    if (mc_dm_peer_) {
+        // A MeshCore thread is open: it stays open through settings changes, the way a
+        // Meshtastic thread does, unless MeshCore went off or the node is gone.
+        const meshcore::NodeList::Entry* e = mc_nodes_ ? mc_nodes_->find(mc_dm_peer_) : nullptr;
+        if (cfg_.mc.enabled && e) {
+            chat_view_.set_channel_label("MC:D");
+            chat_view_.set_encrypted(true);
+            chat_view_.set_mc_dm(mc_dm_peer_, e->name);
+            return;
+        }
+        mc_dm_peer_ = 0;
+    }
     if (cfg_.mc.enabled && cfg_.mc.open) {
         // The chat is on a MeshCore channel; Meshtastic keeps its active channel for
         // everything it sends on its own.
