@@ -94,8 +94,22 @@ struct LoRaDiag {
     uint32_t whole_max_cycles;      // largest whole execute() since the baseband started
     uint32_t bad_info;              // last CRC-bad MeshCore frame: len | buffers missed since FINE << 8 | count << 16
     uint8_t bad_frame[64];          // ...and its bytes
+    // Every symbol of the MeshCore packet being received (header block reduced, then the
+    // payload as demodulated, before Gray decoding), and a copy of the last CRC-bad one.
+    // info: symbol count | search candidates << 8 | best parity failures << 16 | hs << 24
+    uint32_t live_info, bad_sym_info;
+    uint8_t live_syms[192], bad_syms[192];
+    uint32_t search_lag;            // buffers the last search kept the demod waiting
 };
-volatile LoRaDiag g_lora_diag __attribute__((used)) = {0x44494147u, {}, 0, 0, {}, {}, {}, 0, 0, 0, {}};
+volatile LoRaDiag g_lora_diag __attribute__((used)) = {0x44494147u, {}, 0, 0, {}, {}, {}, 0, 0, 0, {}, 0, 0, {}, {}, 0};
+static inline void diag_sym(uint8_t net, uint32_t v) {
+    if (net != 1) return;
+    const uint32_t n = g_lora_diag.live_info & 0xFF;
+    if (n < sizeof(g_lora_diag.live_syms)) {
+        g_lora_diag.live_syms[n] = static_cast<uint8_t>(v);
+        g_lora_diag.live_info = (g_lora_diag.live_info & ~0xFFu) | (n + 1);
+    }
+}
 #define DIAG(k) (g_lora_diag.c[net_ & 1][k] = g_lora_diag.c[net_ & 1][k] + 1)
 #else
 #define DIAG(k) ((void)0)
@@ -827,6 +841,8 @@ void LoRaRxChain::send_packet(const uint8_t* data, size_t len) {
             for (size_t i = 0; i < n; i++) g_lora_diag.bad_frame[i] = data[i];
             const uint32_t miss = (shared_memory.m4_buffer_missed - sf11_miss0_) & 0xFF;
             g_lora_diag.bad_info = (uint32_t)n | (miss << 8) | ((g_lora_diag.c[1][11] & 0xFFFF) << 16);
+            for (size_t i = 0; i < sizeof(g_lora_diag.bad_syms); i++) g_lora_diag.bad_syms[i] = g_lora_diag.live_syms[i];
+            g_lora_diag.bad_sym_info = g_lora_diag.live_info;
         }
 #endif
     }
@@ -1444,6 +1460,9 @@ bool LoRaRxChain::sf11_try_decode() {
 // usually gets there within a few candidates.
 void LoRaRxChain::sf11_search_begin() {
     DIAG(4);
+#if LORA_DIAG
+    if (net_ == 1) g_lora_diag.search_lag = 0;
+#endif
     srch_pending_ = true;
     srch_next_ = 0;
     srch_best_bad_ = 0xFF;
@@ -1461,6 +1480,7 @@ void LoRaRxChain::sf11_search_step() {
     const int N = static_cast<int>(chips_per_symbol);
 #if LORA_DIAG
     g_lora_diag.search_slices = g_lora_diag.search_slices + 1;
+    if (net_ == 1) g_lora_diag.search_lag = g_lora_diag.search_lag + 1;
 #endif
     bool first = true;  // at least one candidate per slice, so the search always moves
     while (srch_next_ < TOTAL) {
@@ -1513,6 +1533,13 @@ bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off
     }
     const uint8_t len = decode_header();  // sets header_valid_ + hdr_extra_*
     if (!header_valid_ || len < 4 || len > MAX_PAYLOAD) return false;
+#if LORA_DIAG
+    if (net_ == 1) {
+        g_lora_diag.live_info = ((uint32_t)srch_next_ << 8) | ((uint32_t)srch_best_bad_ << 16) | ((uint32_t)(hs & 0xFF) << 24);
+        for (int i = 0; i < 8; i++)
+            diag_sym(1, static_cast<uint32_t>(lora::ldro_div4(static_cast<uint32_t>((((int)B[i] - (int)off) % N + N) % N), static_cast<uint32_t>(N))));
+    }
+#endif
     payload_len_target_ = len;
     sym_in_block_ = 0;
     payload_sym_count_ = 0;
@@ -1530,6 +1557,9 @@ bool LoRaRxChain::sf11_commit(const int16_t* B, uint8_t nb, int da, uint32_t off
         // and the channel-hash byte after them did not, so the M0 dropped
         // the packet at its channel filter without a trace.
         if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
+#if LORA_DIAG
+        diag_sym(net_, sv);
+#endif
         sym_block_[sym_in_block_++] = static_cast<uint16_t>(sv ^ (sv >> 1));
         if (sym_in_block_ >= rx_cw_len_) {
             process_sym_block();
@@ -1971,6 +2001,9 @@ void LoRaRxChain::sf11_consume() {
         // otherwise - and folding the residual into the group decision was the last one
         // left. If the boundary survives this, the fault is older than anything I added.
         if (use_ldro_) sv = lora::ldro_div4(sv, static_cast<uint32_t>(N));
+#if LORA_DIAG
+        diag_sym(net_, sv);
+#endif
         // A tracking loop used to sit here and it was wrong in its premise. The residual
         // is where the peak sits INSIDE its bin, not evidence that the peak is moving:
         // a signal parked at b+0.3 hands over +0.3 every symbol, and integrating that
