@@ -800,6 +800,8 @@ class RadioModeText : public Text {
     // Text answers a finger and nothing else: its on_select is wired to on_touch alone,
     // so a control reachable by the navigation cross could not be pressed by it.
     bool on_key(const KeyEvent key) override;
+    // ...and a finger gets one step per tap, not the two Text gives it.
+    bool on_touch(const TouchEvent event) override;
 
    private:
     void restyle(bool focused);
