@@ -537,6 +537,18 @@ class LoRaRxChain {
     bool cand_crc_{false};
     uint8_t cand_parity_bad_{0xFF};
     bool header_plausible(const uint8_t* frame, uint8_t len) const;
+    // MeshCore's header search scores every candidate, and all of them in one go took the
+    // M4 past a buffer's deadline on top of what two chains already cost: the buffer
+    // missed then shifted every symbol after it, and each packet arrived "crc bad" (seen
+    // with a real MeshCore node, 2026-11-16). So it runs in slices, each stopping short of
+    // the deadline, and resumes with the next buffer until it decides.
+    void sf11_search_begin();
+    void sf11_search_step();
+    bool srch_pending_{false};
+    uint8_t srch_next_{0};  // next candidate: header start * (2 * SF11_OFF_RAD + 1) + offset index
+    uint8_t srch_best_bad_{0xFF};
+    int8_t srch_best_hs_{-1};
+    uint32_t srch_best_off_{0};
 };
 
 // The LoRa receive baseband: one chain for the application's main network, and an

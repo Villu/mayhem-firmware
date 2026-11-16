@@ -75,6 +75,22 @@ static inline void prof_add(int k, uint32_t c) {
 #include <algorithm>
 #include <complex>
 
+// The M4's cycle counter (DWT_CYCCNT) when the buffer now being processed arrived, so
+// work that can wait - MeshCore's header search - stops short of the buffer's deadline.
+// The host harness has no counter: there both read 0 and nothing ever waits.
+static uint32_t g_buf_t0 = 0;
+static inline uint32_t dwt_cycles() {
+#if defined(__arm__)
+    return *reinterpret_cast<volatile uint32_t*>(0xE0001004u);
+#else
+    return 0;
+#endif
+}
+// A buffer is due every 208,896 cycles (2048 samples at 2 MS/s, 204 MHz). A search slice
+// starts no new candidate after this point: one candidate is a few thousand cycles and
+// little else runs after the search in the same buffer.
+static constexpr uint32_t SEARCH_DEADLINE_CYCLES = 150000u;
+
 // --- Standalone radix-2 in-place FFT (no dsp_fft.hpp size limit) -------------
 // n must be a power of two. Operates on complex<float> array of exactly n elements.
 static void lora_fft_inplace(std::complex<float>* data, size_t n) {
@@ -227,7 +243,18 @@ void LoRaRxChain::process_sym_block() {
 
     uint16_t cw[12] = {};
     lora::deinterleave(sym_block_.data(), cpb, cr, cw);
-    for (int i = 0; i < cpb; i++) feed_nibble(lora::hamming_top4(cw[i], cr));
+    // MeshCore sends CR 4/8, and there the parity is worth using: the code's distance is
+    // four, and hamming_correct84 flips a data bit only on one of the four weight-3
+    // syndromes, which two errors can never produce (theirs have even weight). So a
+    // single wrong bit per code word - what one wrong symbol leaves in a block - is put
+    // right, and a double one is left as it came, as before. Without this a MeshCore
+    // packet failed its CRC on any one off-by-one symbol: a T-Deck's 53-byte messages
+    // arrived "crc bad" with four bytes each one bit wrong, all in a single block
+    // (2026-11-16). The shorter codes cannot correct safely (see hamming_top4), and the
+    // Meshtastic chain keeps its proven path.
+    const bool correct = (gate_ != Gate::Meshtastic && cr == 8);
+    for (int i = 0; i < cpb; i++)
+        feed_nibble(correct ? lora::hamming_correct84(static_cast<uint8_t>(cw[i])) : lora::hamming_top4(cw[i], cr));
 }
 
 // --- Main symbol window processor -------------------------------------------
@@ -858,6 +885,7 @@ void LoRaRxChain::sf11_reset() {
     // Reception is over (delivered or abandoned): let the application transmit again.
     set_rx_busy(false);
     sf11_state_ = Sf11State::HUNT;
+    srch_pending_ = false;
     sf11_pre_run_ = 0;
     sf11_prev_bin_ = -99;
     sf11_confirmed_ = false;
@@ -1353,6 +1381,55 @@ bool LoRaRxChain::sf11_try_decode() {
     return sf11_commit(B, static_cast<uint8_t>(sf11_fine_syms_ - best_hs), best_da, best_off, best_hs);
 }
 
+// MeshCore's header search (see srch_pending_): the same candidates in the same order as
+// sf11_try_decode's scored search, the same winner - the first with the fewest parity
+// failures - but in slices that stop short of the buffer's deadline. A candidate with no
+// failures cannot be beaten, so the search ends there; nearest first, a clean packet
+// usually gets there within a few candidates.
+void LoRaRxChain::sf11_search_begin() {
+    srch_pending_ = true;
+    srch_next_ = 0;
+    srch_best_bad_ = 0xFF;
+    srch_best_hs_ = -1;
+    srch_best_off_ = 0;
+    // Begun late in a buffer (straight after a demod step), the first slice waits for the
+    // next one, which resumes it before any other work of the chain.
+    if (dwt_cycles() - g_buf_t0 < SEARCH_DEADLINE_CYCLES) sf11_search_step();
+}
+
+void LoRaRxChain::sf11_search_step() {
+    static_assert(SF11_DA == 0, "the sliced search assumes a single da candidate");
+    constexpr int PER_HS = 2 * SF11_OFF_RAD + 1;
+    constexpr int TOTAL = (SF11_HS_MAX + 1) * PER_HS;
+    const int N = static_cast<int>(chips_per_symbol);
+    bool first = true;  // at least one candidate per slice, so the search always moves
+    while (srch_next_ < TOTAL) {
+        if (!first && dwt_cycles() - g_buf_t0 > SEARCH_DEADLINE_CYCLES) return;  // the rest next buffer
+        first = false;
+        const int hs = srch_next_ / PER_HS, k = srch_next_ % PER_HS;
+        ++srch_next_;
+        const int od = (k & 1) ? -((k + 1) / 2) : (k / 2);  // 0, -1, +1, -2, +2, ...
+        const uint32_t off = static_cast<uint32_t>(((int)sf11_off0_ + od) % N + N) % N;
+        uint8_t frame[12];
+        const uint8_t L = sf11_decode_bins(&sf11_bins_[SF11_DA][hs], static_cast<uint8_t>(sf11_fine_syms_ - hs),
+                                           off, frame, sizeof(frame));
+        if (L < 4 || !header_plausible(frame, L)) continue;
+        if (cand_parity_bad_ < srch_best_bad_) {
+            srch_best_bad_ = cand_parity_bad_;
+            srch_best_hs_ = static_cast<int8_t>(hs);
+            srch_best_off_ = off;
+            if (srch_best_bad_ == 0) break;
+        }
+    }
+    srch_pending_ = false;
+    // One wrong symbol in the block spoils the parity of up to SF code words, so this
+    // allows a damaged block through; a misaligned one fails nearly all of them.
+    if (srch_best_hs_ < 0 || srch_best_bad_ > spreading_factor / 2 ||
+        !sf11_commit(&sf11_bins_[SF11_DA][srch_best_hs_], static_cast<uint8_t>(sf11_fine_syms_ - srch_best_hs_), 0,
+                     srch_best_off_, srch_best_hs_))
+        sf11_reset();
+}
+
 // The chosen candidate: decode its header into the member chain, replay the payload
 // symbols already buffered, and keep streaming the rest (or deliver at once when the
 // whole frame was in the buffer).
@@ -1575,7 +1652,12 @@ void LoRaRxChain::execute_sf11(const buffer_c8_t& buffer) {
     // deadline, and an overrun SKIPS buffers rather than queueing them, which shreds the
     // stream (42% of buffers lost, preamble reads as non-periodic).  See the SF11_STEPS
     // budget notes in the header.
+    if (srch_pending_) {
+        sf11_search_step();
+        if (srch_pending_) return;  // the samples wait in the ring; the demod resumes after
+    }
     for (uint32_t k = 0; k < sf11_steps_per_call_; ++k) {
+        if (srch_pending_) return;  // a search began in this buffer and ran out of time
         if (!sf11_job_active_ && !sf11_start_job()) return;  // nothing ready to demod
         if (!sf11_demod_step()) continue;                    // still working on this one
         sf11_job_active_ = false;
@@ -1786,7 +1868,9 @@ void LoRaRxChain::sf11_consume() {
         if (++sf11_fine_da_ >= SF11_NDA) {
             sf11_fine_da_ = 0;
             if (++sf11_fine_sym_ >= sf11_fine_syms_) {
-                if (!sf11_try_decode()) {
+                if (gate_ != Gate::Meshtastic) {
+                    sf11_search_begin();  // decides now, or over the next buffers
+                } else if (!sf11_try_decode()) {
 #if SF11_DEBUG
                     g_dbg_stage = 2;
                     g_dbg_stage_ready = true;  // DEC marker shows the best-aligned bytes
@@ -2023,6 +2107,7 @@ static inline uint32_t cycles_now() {
 
 void LoRaProcessor::execute(const buffer_c8_t& buffer) {
     const uint32_t t0 = cycles_now();
+    g_buf_t0 = t0;
 #if LORA_PROF
     prof_dec_cycles = 0;
 #endif
