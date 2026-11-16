@@ -162,17 +162,31 @@ bool MeshRouter::on_raw_rx(const uint8_t* raw, size_t len, int8_t rssi, float sn
     // Deduplication
     if (is_duplicate(pkt.header.from, pkt.header.packet_id)) {
         counters_.rx_dupe++;
+        // The sender only repeats a packet that wants an ACK because it did not get one:
+        // ours was lost on the way back. Stock Meshtastic acknowledges the repeat again
+        // (ReliableRouter); dropping it in silence turned one lost ACK into "max
+        // retransmit" at the far end for a message we had shown long ago.
+        if (pkt.header.to == local_node_id_ && pkt.header.want_ack() && !crc_failed) {
+            reack_dest_ = pkt.header.from;
+            reack_id_ = pkt.header.packet_id;
+            reack_ch_ = (ch > 0) ? static_cast<uint8_t>(ch) : 0;
+        }
         return false;
     }
-    mark_seen(pkt.header.from, pkt.header.packet_id);
+    // Not marked seen yet: only a frame that proves sound below is. A damaged first copy
+    // used to be entered here and then thrown away, which made every clean retransmission
+    // of it a "duplicate" - the message was neither shown nor acknowledged, ever.
 
     // Nothing here to decode or show - just carry it one hop further for its owner.
     // The caller applies the node's role (a muted or hidden client repeats nothing)
     // before it actually keys the radio, so that check does not belong here.
     // Relaying a damaged frame spreads the corruption into other people's meshes, and
     // it cannot be checked again downstream because the CRC travels with the payload.
-    if (relay_only)
-        return !damaged && !mqtt_ignored && pkt.header.hop_limit() > 0;
+    if (relay_only) {
+        if (damaged) return false;
+        mark_seen(pkt.header.from, pkt.header.packet_id);
+        return !mqtt_ignored && pkt.header.hop_limit() > 0;
+    }
 
     const uint8_t* payload = raw + PKT_HEADER_SIZE;
     const size_t pay_len = len - PKT_HEADER_SIZE;
@@ -208,6 +222,7 @@ bool MeshRouter::on_raw_rx(const uint8_t* raw, size_t len, int8_t rssi, float sn
     // header, which has no checksum of its own worth the name, so learning a node from
     // a damaged frame is how the list fills with neighbours nobody can hear.
     if (damaged) return false;
+    mark_seen(pkt.header.from, pkt.header.packet_id);
 
     // Update node DB with signal info. Hops travelled = hop_start - hop_limit
     // (0 for a direct neighbour). The old code used MAX_HOP_LIMIT as the baseline,
@@ -405,7 +420,10 @@ size_t MeshRouter::build_text_tx(uint8_t* out_buf, size_t max_len, const char* t
     size_t data_len = build_data_payload(data_buf, sizeof(data_buf),
                                          PortNum::TEXT_MESSAGE,
                                          reinterpret_cast<const uint8_t*>(text),
-                                         text_len, want_ack, ok_to_mqtt_);
+                                         text_len, false /* want_response */, ok_to_mqtt_);
+    // want_ack travels in the header (below). It used to be passed here as well, into
+    // want_response - and a stock node answers a text that asks for a response it has no
+    // module to give with a NO_RESPONSE NAK: delivered, but shown here as "refused".
 
     if (const size_t n = build_pki_packet(out_buf, max_len, dest, pid, want_ack,
                                           data_buf, data_len))

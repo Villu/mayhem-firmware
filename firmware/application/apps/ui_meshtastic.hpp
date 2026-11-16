@@ -2335,6 +2335,19 @@ class MeshtasticView : public View {
     uint8_t ack_channel_{0};
     bool apply_radio_{false};
     uint32_t identity_sig_{0};                         // last announced identity, to avoid re-announcing
+    // Where we can be heard: channel hash, preset, region, slot and frequency override. A change
+    // moves us to air that other nodes have not heard us on yet, so it is announced at once
+    // instead of at the next NodeInfo period - up to its full length of silence otherwise.
+    uint32_t air_sig_{0};
+    bool air_sig_set_{false};
+    void note_air_change();
+    // Our own unprompted broadcasts (NodeInfo, position, telemetry, neighbours) keep this many
+    // ticks apart. A stock client relays what it hears after a contention delay that reaches
+    // ~9 s at NARROW_FAST, and cannot receive while it does: the 3 s between the start-up
+    // NodeInfo and telemetry put the second one on top of the relay of the first.
+    static constexpr uint32_t OWN_BCAST_GAP = 15u * 60u;  // ~15 s at ~60 Hz
+    uint32_t last_own_bcast_{0};
+    bool own_bcast_due(uint32_t& timer, uint32_t period);
     static constexpr uint16_t APPLY_DELAY_TICKS = 72;  // ~1.2 s at ~60 Hz
     void apply_settings();
     uint32_t identity_signature() const;
