@@ -3402,20 +3402,25 @@ void MeshtasticNodesView::focus() {
     Widget::focus();
 }
 
-void MeshtasticNodesView::move_selection(int delta) {
+// One row up (delta < 0) or down. False at either end, where there is no row to go to:
+// the caller then lets the focus leave the list.
+bool MeshtasticNodesView::move_selection(int delta) {
     const size_t total = total_rows();
-    if (total == 0) return;
-    int sel = static_cast<int>(selected_) + delta;
-    if (sel < 0) sel = 0;
-    if (sel >= static_cast<int>(total)) sel = static_cast<int>(total) - 1;
-    if (static_cast<size_t>(sel) == selected_) return;  // at a boundary -> no repaint
-    selected_ = static_cast<size_t>(sel);
+    if (total == 0) return false;
+    const size_t heading = mc_count_ ? order_.size() : total;  // the MeshCore heading is not a node
+    size_t sel = std::min(selected_, total - 1);
+    do {
+        if (delta < 0 ? sel == 0 : sel + 1 >= total) return false;
+        sel = delta < 0 ? sel - 1 : sel + 1;
+    } while (sel == heading);
+    selected_ = sel;
     // Keep the selection on-screen.
     if (selected_ < scroll_offset_)
         scroll_offset_ = selected_;
     else if (selected_ >= scroll_offset_ + VISIBLE)
         scroll_offset_ = selected_ - VISIBLE + 1;
     set_dirty();
+    return true;
 }
 
 void MeshtasticNodesView::open_selected() {
@@ -3434,31 +3439,29 @@ void MeshtasticNodesView::open_selected() {
 
 bool MeshtasticNodesView::on_encoder(const EncoderEvent delta) {
     if (delta == 0) return true;
-    if (delta > 0 && selected_ + 1 >= total_rows()) return false;  // out to the buttons
-    // At the top of the list, scrolling further up releases focus so the tab bar
-    // (and thus leaving the Nodes list) is reachable again - otherwise the list
-    // traps the encoder and you can never navigate away.
-    if (delta < 0 && selected_ == 0) return false;
-    move_selection(delta > 0 ? 1 : -1);
-    return true;
+    // Past the last row the focus goes out to the buttons, and past the first one back
+    // to the tab bar - otherwise the list traps the encoder and you can never navigate
+    // away.
+    return move_selection(delta > 0 ? 1 : -1);
 }
 
 bool MeshtasticNodesView::on_key(const KeyEvent key) {
-    // The D-pad crosses the list in one press instead of walking it a row at a time -
-    // the same as the chat, and for the same reason: getting from the tabs to the
-    // buttons underneath should not mean pressing Down once per node. Scrolling is the
-    // encoder's job; Select still opens whatever the encoder left highlighted.
+    // Up and Down walk the rows, like the encoder and like the Chats list. They used to
+    // cross the whole list in one press, which left the D-pad able to open only the row
+    // the encoder had been left on - the first one, for anybody not using the encoder.
     if (key == KeyEvent::Select) {
         open_selected();
         return true;
     }
+    if (key == KeyEvent::Up) return move_selection(-1);  // off the top: back to the tabs
     // The list covers the button row (same rectangle), so the focus manager never finds the buttons "below" it: jump there
-    // explicitly. Up on any button comes back here (see the constructor).
-    if (key == KeyEvent::Down) {
+    // explicitly. Down off the last row does, and Right from any row, so a long list
+    // does not mean one press per node. Up on any button comes back here (see the constructor).
+    if (key == KeyEvent::Right || (key == KeyEvent::Down && !move_selection(1))) {
         button_sort_.focus();
         return true;
     }
-    return false;
+    return key == KeyEvent::Down;
 }
 
 bool MeshtasticNodesView::on_touch(const TouchEvent event) {
@@ -3521,6 +3524,7 @@ void MeshtasticNodesView::paint(Painter& painter) {
 
     rebuild_order();
     const size_t total = total_rows();
+    if (mc_count_ && selected_ == order_.size()) selected_++;  // never on the MeshCore heading
     for (size_t i = 0; i < static_cast<size_t>(VISIBLE); i++) {
         const size_t pos = i + scroll_offset_;
         if (pos >= total) break;
