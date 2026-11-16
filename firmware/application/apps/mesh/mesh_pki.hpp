@@ -30,6 +30,27 @@ void x25519_base(uint8_t pub[32], const uint8_t priv[32]);
 // Clamp a 32-byte random value into a valid X25519 private key (in place).
 void clamp_private(uint8_t priv[32]);
 
+// SHA-512, streaming (Ed25519 hashes a key half and a message given in pieces).
+struct Sha512 {
+    uint64_t st[8];
+    uint8_t buf[128];
+    uint64_t total;
+    size_t fill;
+    void init();
+    void update(const uint8_t* p, size_t len);
+    void final(uint8_t out[64]);
+};
+
+// Ed25519 (RFC 8032) with the 64-byte expanded private key MeshCore keeps and exports
+// (orlp/ed25519 layout): prv[0..31] = the scalar (clamped here anyway), prv[32..63] =
+// the nonce prefix. From a 32-byte seed: prv = SHA-512(seed).
+void ed25519_public(uint8_t pub[32], const uint8_t prv[64]);
+void ed25519_sign(uint8_t sig[64], const uint8_t* msg, size_t len, const uint8_t pub[32], const uint8_t prv[64]);
+// MeshCore's shared secret (orlp ed25519_key_exchange): X25519 of our scalar with the
+// peer's Ed25519 key mapped to Curve25519. Used raw: AES-128 key = first 16 bytes, HMAC
+// key = all 32. false when the result is all zero (a bad key).
+bool ed25519_key_exchange(uint8_t shared[32], const uint8_t their_pub[32], const uint8_t prv[64]);
+
 // AES-256-CCM (Meshtastic uses an 8-byte auth tag, 13-byte nonce).
 // Encrypt: writes len ciphertext bytes to out and 8 tag bytes to tag.
 void aes_ccm_encrypt(const uint8_t key[32], const uint8_t* nonce, size_t nonce_len, const uint8_t* in, size_t len, uint8_t* out, uint8_t tag[8]);

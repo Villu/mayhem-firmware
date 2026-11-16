@@ -24,6 +24,7 @@ testing the code that ships. Any C++17 compiler will do.
 | `test_mesh_router` | dedup, relay mutation, channel hash filtering, packet id seeding, the traceroute request |
 | `test_mesh_telemetry` | telemetry encode and decode per variant |
 | `test_mesh_partial` | decoding a packet whose tail was cut off mid-field |
+| `test_meshcore` | MeshCore against real captured packets (group texts on public and hashtag channels, relayed copies, an advert) and an independent reference (signed advert, direct message, ACKs); AES-128, HMAC-SHA256, SHA-512 and Ed25519 against their standards |
 
 A round-trip test proves only that the two ends agree with each other. That is why
 `test_lora_framing` also carries a real frame from a stock node: a wrong coding rate

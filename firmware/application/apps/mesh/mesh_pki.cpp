@@ -194,21 +194,40 @@ void inv25519(gf o, const gf i) {
     for (int a = 0; a < 16; a++) o[a] = c[a];
 }
 
-}  // namespace
-
 // The scratch field elements are static rather than automatic. Seven gf plus the
 // temporaries inside M() and inv25519() come to roughly 1.4 KB, and this runs during
 // app construction on the M0's 4 KB main stack - which overflowed into a Guru
 // Meditation the moment PKC was enabled. Curve25519 here is only ever called from the
 // UI thread (key derivation, direct message encrypt/decrypt), never from an interrupt,
 // so a single shared scratch area is safe and costs BSS instead of stack.
-void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]) {
-    uint8_t z[32];
-    static gf x, a, b, c, d, e, f;
-    for (int i = 0; i < 31; i++) z[i] = scalar[i];
-    z[31] = (scalar[31] & 127) | 64;
-    z[0] &= 248;
-    unpack25519(x, point);
+//
+// One pool for everything below, X25519 and the Ed25519 signing beside it: they never
+// run at the same time, and M0 RAM is what the Mesh app runs short of. Between point
+// multiplications the same bytes serve the scalar reduction mod L (the first 64 words)
+// and the SHA-512 state (the last two slots): Ed25519 signing hashes, reduces and
+// multiplies one after another, never two at once.
+union Scratch {
+    int64_t gf[8 * 16];
+    struct {
+        int64_t pad[6 * 16];
+        Sha512 sha;
+    } h;
+};
+static_assert(sizeof(Sha512) <= 2 * 16 * sizeof(int64_t), "SHA-512 state must fit two field slots");
+Scratch g_scratch;
+int64_t* const g_pool = g_scratch.gf;
+int64_t* const x = g_pool;
+int64_t* const a = g_pool + 16;
+int64_t* const b = g_pool + 32;
+int64_t* const c = g_pool + 48;
+int64_t* const d = g_pool + 64;
+int64_t* const e = g_pool + 80;
+int64_t* const f = g_pool + 96;
+int64_t* const g = g_pool + 112;
+
+// Montgomery ladder over scalar bits 254..0 (no clamping here): leaves (a:c) = k*P and
+// (b:d) = (k+1)*P, with P's u-coordinate in x.
+void ladder(const uint8_t z[32]) {
     for (int i = 0; i < 16; i++) {
         b[i] = x[i];
         d[i] = a[i] = c[i] = 0;
@@ -239,6 +258,17 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]) 
         sel25519(a, b, r);
         sel25519(c, d, r);
     }
+}
+
+}  // namespace
+
+void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]) {
+    uint8_t z[32];
+    for (int i = 0; i < 31; i++) z[i] = scalar[i];
+    z[31] = (scalar[31] & 127) | 64;
+    z[0] &= 248;
+    unpack25519(x, point);
+    ladder(z);
     inv25519(c, c);
     M(a, a, c);
     pack25519(out, a);
@@ -253,6 +283,272 @@ void clamp_private(uint8_t priv[32]) {
     priv[0] &= 248;
     priv[31] &= 127;
     priv[31] |= 64;
+}
+
+// ============================================================================
+// SHA-512 (FIPS 180-4), for Ed25519
+// ============================================================================
+
+namespace {
+
+const uint64_t K512[80] = {
+    0x428a2f98d728ae22ull, 0x7137449123ef65cdull, 0xb5c0fbcfec4d3b2full, 0xe9b5dba58189dbbcull,
+    0x3956c25bf348b538ull, 0x59f111f1b605d019ull, 0x923f82a4af194f9bull, 0xab1c5ed5da6d8118ull,
+    0xd807aa98a3030242ull, 0x12835b0145706fbeull, 0x243185be4ee4b28cull, 0x550c7dc3d5ffb4e2ull,
+    0x72be5d74f27b896full, 0x80deb1fe3b1696b1ull, 0x9bdc06a725c71235ull, 0xc19bf174cf692694ull,
+    0xe49b69c19ef14ad2ull, 0xefbe4786384f25e3ull, 0x0fc19dc68b8cd5b5ull, 0x240ca1cc77ac9c65ull,
+    0x2de92c6f592b0275ull, 0x4a7484aa6ea6e483ull, 0x5cb0a9dcbd41fbd4ull, 0x76f988da831153b5ull,
+    0x983e5152ee66dfabull, 0xa831c66d2db43210ull, 0xb00327c898fb213full, 0xbf597fc7beef0ee4ull,
+    0xc6e00bf33da88fc2ull, 0xd5a79147930aa725ull, 0x06ca6351e003826full, 0x142929670a0e6e70ull,
+    0x27b70a8546d22ffcull, 0x2e1b21385c26c926ull, 0x4d2c6dfc5ac42aedull, 0x53380d139d95b3dfull,
+    0x650a73548baf63deull, 0x766a0abb3c77b2a8ull, 0x81c2c92e47edaee6ull, 0x92722c851482353bull,
+    0xa2bfe8a14cf10364ull, 0xa81a664bbc423001ull, 0xc24b8b70d0f89791ull, 0xc76c51a30654be30ull,
+    0xd192e819d6ef5218ull, 0xd69906245565a910ull, 0xf40e35855771202aull, 0x106aa07032bbd1b8ull,
+    0x19a4c116b8d2d0c8ull, 0x1e376c085141ab53ull, 0x2748774cdf8eeb99ull, 0x34b0bcb5e19b48a8ull,
+    0x391c0cb3c5c95a63ull, 0x4ed8aa4ae3418acbull, 0x5b9cca4f7763e373ull, 0x682e6ff3d6b2b8a3ull,
+    0x748f82ee5defb2fcull, 0x78a5636f43172f60ull, 0x84c87814a1f0ab72ull, 0x8cc702081a6439ecull,
+    0x90befffa23631e28ull, 0xa4506cebde82bde9ull, 0xbef9a3f7b2c67915ull, 0xc67178f2e372532bull,
+    0xca273eceea26619cull, 0xd186b8c721c0c207ull, 0xeada7dd6cde0eb1eull, 0xf57d4f7fee6ed178ull,
+    0x06f067aa72176fbaull, 0x0a637dc5a2c898a6ull, 0x113f9804bef90daeull, 0x1b710b35131c471bull,
+    0x28db77f523047d84ull, 0x32caab7b40c72493ull, 0x3c9ebe0a15c9bebcull, 0x431d67c49c100d4cull,
+    0x4cc5d4becb3e42b6ull, 0x597f299cfc657e2aull, 0x5fcb6fab3ad6faecull, 0x6c44198c4a475817ull};
+
+inline uint64_t ror64(uint64_t v, int n) {
+    return (v >> n) | (v << (64 - n));
+}
+
+void sha512_block(uint64_t st[8], const uint8_t* p) {
+    // A rolling 16-word schedule: 128 bytes of stack instead of 640.
+    uint64_t w[16];
+    for (int i = 0; i < 16; i++) {
+        uint64_t v = 0;
+        for (int k = 0; k < 8; k++) v = (v << 8) | p[8 * i + k];
+        w[i] = v;
+    }
+    uint64_t s[8];
+    for (int i = 0; i < 8; i++) s[i] = st[i];
+    for (int t = 0; t < 80; t++) {
+        if (t >= 16) {
+            const uint64_t w15 = w[(t - 15) & 15], w2 = w[(t - 2) & 15];
+            const uint64_t s0 = ror64(w15, 1) ^ ror64(w15, 8) ^ (w15 >> 7);
+            const uint64_t s1 = ror64(w2, 19) ^ ror64(w2, 61) ^ (w2 >> 6);
+            w[t & 15] += s0 + w[(t - 7) & 15] + s1;
+        }
+        const uint64_t S1 = ror64(s[4], 14) ^ ror64(s[4], 18) ^ ror64(s[4], 41);
+        const uint64_t ch = (s[4] & s[5]) ^ (~s[4] & s[6]);
+        const uint64_t t1 = s[7] + S1 + ch + K512[t] + w[t & 15];
+        const uint64_t S0 = ror64(s[0], 28) ^ ror64(s[0], 34) ^ ror64(s[0], 39);
+        const uint64_t maj = (s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2]);
+        for (int k = 7; k > 0; k--) s[k] = s[k - 1];
+        s[4] += t1;
+        s[0] = t1 + S0 + maj;
+    }
+    for (int i = 0; i < 8; i++) st[i] += s[i];
+}
+
+}  // namespace
+
+void Sha512::init() {
+    static const uint64_t IV[8] = {0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull, 0x3c6ef372fe94f82bull,
+                                   0xa54ff53a5f1d36f1ull, 0x510e527fade682d1ull, 0x9b05688c2b3e6c1full,
+                                   0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull};
+    for (int i = 0; i < 8; i++) st[i] = IV[i];
+    total = 0;
+    fill = 0;
+}
+
+void Sha512::update(const uint8_t* p, size_t len) {
+    total += len;
+    while (len) {
+        size_t n = 128 - fill;
+        if (n > len) n = len;
+        memcpy(buf + fill, p, n);
+        fill += n;
+        p += n;
+        len -= n;
+        if (fill == 128) {
+            sha512_block(st, buf);
+            fill = 0;
+        }
+    }
+}
+
+void Sha512::final(uint8_t out[64]) {
+    const uint64_t bits = total * 8;
+    buf[fill++] = 0x80;
+    if (fill > 112) {
+        memset(buf + fill, 0, 128 - fill);
+        sha512_block(st, buf);
+        fill = 0;
+    }
+    memset(buf + fill, 0, 120 - fill);  // the top 64 bits of the 128-bit length stay zero
+    for (int k = 0; k < 8; k++) buf[120 + k] = static_cast<uint8_t>(bits >> (56 - 8 * k));
+    sha512_block(st, buf);
+    for (int i = 0; i < 8; i++)
+        for (int k = 0; k < 8; k++) out[8 * i + k] = static_cast<uint8_t>(st[i] >> (56 - 8 * k));
+}
+
+// ============================================================================
+// Ed25519 (RFC 8032) for MeshCore identities
+// ============================================================================
+//
+// The point multiplication is the X25519 Montgomery ladder above plus Okeya-Sakurai
+// y-recovery (Costello & Smith, "Montgomery curves and their arithmetic", Alg. 5), then
+// the birational map to Edwards: x = C*u/v, y = (u-1)/(u+1). That reuses the field code
+// and scratch X25519 already has, where the usual extended-coordinate Edwards code would
+// want another 2 KB of field temporaries the M0 does not have. Scalar reduction mod L is
+// TweetNaCl's.
+
+namespace {
+
+// sqrt(-486664), the root that maps Curve25519's base point onto Ed25519's.
+const gf K_C = {0x7e06, 0xff45, 0x04aa, 0xcc6e, 0x1a82, 0x4b7d, 0xd3d1, 0xc5a1,
+                0x4f7e, 0x03fc, 0x08dc, 0xd27b, 0x06bb, 0x60a0, 0xedf4, 0x0f26};
+// 2 * v of the Curve25519 base point (u = 9) that goes with K_C.
+const gf K_2V = {0x583b, 0x0262, 0x74bb, 0xac2c, 0x3c9b, 0x2507, 0x6503, 0xdb85,
+                 0x5d66, 0x116e, 0x45a7, 0x3fc2, 0xf296, 0x8ebe, 0xccbc, 0x3ea3};
+const gf K_2A = {0xda0c, 0x000e};  // 2 * 486662
+const gf K_9 = {9};                // u of the base point
+
+int par25519(const gf v) {
+    uint8_t t[32];
+    pack25519(t, v);
+    return t[0] & 1;
+}
+
+// Ed25519 encoding of s * B (s < 2^255, not clamped).
+void scalarbase(uint8_t out[32], const uint8_t s[32]) {
+    for (int i = 0; i < 16; i++) x[i] = 0;
+    x[0] = 9;
+    ladder(s);  // (a:c) = sB, (b:d) = (s+1)B, Montgomery x only
+    // y-recovery: (f : x : g) = sB projective on the Montgomery curve. x is free again
+    // (the base point is the constant 9), so it serves as a temporary.
+    M(e, K_9, c);
+    A(f, a, e);
+    Z(g, a, e);
+    S(g, g);
+    M(g, g, b);
+    M(e, K_2A, c);
+    A(f, f, e);
+    M(x, K_9, a);
+    A(x, x, c);
+    M(f, f, x);
+    M(e, e, c);
+    Z(f, f, e);
+    M(f, f, d);
+    Z(x, f, g);  // V
+    M(e, K_2V, c);
+    M(e, e, d);
+    M(f, e, a);  // U
+    M(g, e, c);  // W
+    // Edwards, one inversion for both: 1 / (V (U+W)).
+    A(a, f, g);
+    Z(b, f, g);
+    M(c, x, a);
+    inv25519(c, c);
+    M(d, b, x);
+    M(d, d, c);  // y = (U-W) / (U+W)
+    M(e, f, a);
+    M(e, e, c);
+    M(e, e, K_C);  // x = C U / V
+    pack25519(out, d);
+    out[31] ^= static_cast<uint8_t>(par25519(e) << 7);
+}
+
+const int64_t L25519[32] = {0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7,
+                            0xa2, 0xde, 0xf9, 0xde, 0x14, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10};
+
+// r = v mod L, v given as 64 signed limbs of 8 bits (TweetNaCl modL). v is the pool.
+void modL(uint8_t r[32], int64_t* v) {
+    int64_t carry;
+    for (int i = 63; i >= 32; --i) {
+        carry = 0;
+        int j;
+        for (j = i - 32; j < i - 12; ++j) {
+            v[j] += carry - 16 * v[i] * L25519[j - (i - 32)];
+            carry = (v[j] + 128) >> 8;
+            v[j] -= carry * 256;
+        }
+        v[j] += carry;
+        v[i] = 0;
+    }
+    carry = 0;
+    for (int j = 0; j < 32; j++) {
+        v[j] += carry - (v[31] >> 4) * L25519[j];
+        carry = v[j] >> 8;
+        v[j] &= 255;
+    }
+    for (int j = 0; j < 32; j++) v[j] -= carry * L25519[j];
+    for (int i = 0; i < 32; i++) {
+        v[i + 1] += v[i] >> 8;
+        r[i] = static_cast<uint8_t>(v[i] & 255);
+    }
+}
+
+void reduce64(uint8_t r[32], const uint8_t h[64]) {
+    int64_t* const v = g_pool;
+    for (int i = 0; i < 64; i++) v[i] = h[i];
+    modL(r, v);
+}
+
+// Static, not on the stack (the callers run deep on the M0's process stack), and in the
+// scratch pool rather than beside it: see Scratch.
+Sha512& g_sha512 = g_scratch.h.sha;
+
+}  // namespace
+
+void ed25519_public(uint8_t pub[32], const uint8_t prv[64]) {
+    uint8_t s[32];
+    memcpy(s, prv, 32);
+    s[0] &= 248;
+    s[31] = (s[31] & 63) | 64;
+    scalarbase(pub, s);
+}
+
+void ed25519_sign(uint8_t sig[64], const uint8_t* msg, size_t len, const uint8_t pub[32], const uint8_t prv[64]) {
+    uint8_t hash[64], r[32], k[32];
+    g_sha512.init();
+    g_sha512.update(prv + 32, 32);
+    g_sha512.update(msg, len);
+    g_sha512.final(hash);
+    reduce64(r, hash);
+    scalarbase(sig, r);  // R
+    g_sha512.init();
+    g_sha512.update(sig, 32);
+    g_sha512.update(pub, 32);
+    g_sha512.update(msg, len);
+    g_sha512.final(hash);
+    reduce64(k, hash);
+    // S = r + k * a mod L, a = the clamped scalar.
+    uint8_t s[32];
+    memcpy(s, prv, 32);
+    s[0] &= 248;
+    s[31] = (s[31] & 63) | 64;
+    int64_t* const v = g_pool;
+    for (int i = 0; i < 64; i++) v[i] = 0;
+    for (int i = 0; i < 32; i++) v[i] = r[i];
+    for (int i = 0; i < 32; i++)
+        for (int j = 0; j < 32; j++) v[i + j] += static_cast<int64_t>(k[i]) * s[j];
+    modL(sig + 32, v);
+}
+
+bool ed25519_key_exchange(uint8_t shared[32], const uint8_t their_pub[32], const uint8_t prv[64]) {
+    // Edwards y -> Montgomery u = (1 + y) / (1 - y), then X25519 with our clamped scalar
+    // (orlp ed25519_key_exchange, which MeshCore uses).
+    unpack25519(d, their_pub);
+    for (int i = 0; i < 16; i++) g[i] = 0;
+    g[0] = 1;
+    A(e, g, d);
+    Z(f, g, d);
+    inv25519(f, f);
+    M(e, e, f);
+    uint8_t u[32];
+    pack25519(u, e);
+    x25519(shared, prv, u);
+    uint8_t any = 0;
+    for (int i = 0; i < 32; i++) any |= shared[i];
+    return any != 0;
 }
 
 // ============================================================================
