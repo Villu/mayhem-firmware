@@ -560,6 +560,25 @@ static void map_reserve_restore() {
     if (!g_map_reserve) g_map_reserve = chHeapAlloc(0x0, sizeof(GeoMapView));
 }
 
+// Whether the allocator can serve `bytes` in one piece - and `and_then` more beside
+// it. Asked the only way that is true: take the blocks and give them straight back.
+// chCoreStatus() cannot answer this (see below), and operator new answers it by
+// stopping the device on the red "Out of Memory" screen, serial shell and all.
+static bool heap_has(size_t bytes, size_t and_then = 0) {
+    void* const a = chHeapAlloc(0x0, bytes);
+    void* const b = (a && and_then) ? chHeapAlloc(0x0, and_then) : nullptr;
+    if (b) chHeapFree(b);
+    if (a) chHeapFree(a);
+    return a && (b || !and_then);
+}
+
+// The hour and minute a message was sent or heard, for its card.
+static void stamp_message(ChatMessage& m) {
+    const auto now = rtc_time::now();
+    m.hh = static_cast<uint8_t>(now.hour());
+    m.mm = static_cast<uint8_t>(now.minute());
+}
+
 static bool map_would_fit(MeshtasticChatView* say_here) {
     if (!say_here) say_here = g_chat;
     if (g_map_reserve) {
@@ -1783,6 +1802,13 @@ MeshtasticChatView::MeshtasticChatView(NavigationView& nav,
             write_console("* receive only: tap RX to unlock\n");
             return;
         }
+        // ...and none when the heap could not carry the message through: the entry
+        // view, the text, its line in the chat and in the history. Found out halfway,
+        // that is the red "Out of Memory" screen and a reset by hand.
+        if (!make_room(SEND_ROOM)) {
+            write_console("* out of memory: reopen the app\n");
+            return;
+        }
         compose_str_.clear();
         // MeshCore takes up to 160 characters; Meshtastic's packet holds the 80 the
         // box has always allowed.
@@ -1841,6 +1867,10 @@ bool MeshtasticChatView::on_touch(const TouchEvent event) {
     if (y < r.top() + CON_Y || y >= r.top() + CON_Y + CON_H) return false;
     const size_t idx = console_.message_at(y);  // message_at subtracts its own top
     if (idx >= messages_.size()) return false;
+    if (!heap_has(sizeof(MeshtasticMessageView), 256)) {
+        write_console("* low memory: no room for the message card\n");
+        return true;
+    }
     nav_.push<MeshtasticMessageView>(
         messages_[idx],
         [this](std::string text, uint32_t dest) {
@@ -1857,6 +1887,7 @@ bool MeshtasticChatView::on_touch(const TouchEvent event) {
 // Our own text, on whatever the chat has open: a MeshCore group message on the MeshCore
 // channel, a Meshtastic packet everywhere else.
 void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
+    make_room(MESSAGE_ROOM);
     const bool unicast = (dest != BROADCAST_ADDR);
     const bool meshcore = !unicast && is_mc_channel(channel_idx_);
     uint32_t pid = 0;
@@ -1884,7 +1915,7 @@ void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
     m.from_id = router_.local_node_id();
     m.to_id = dest;
     m.text = text;
-    m.timestamp = to_string_datetime(rtc_time::now(), HM);
+    stamp_message(m);
     m.outgoing = true;
     m.packet_id = pid;
     // Locked to transmit, nothing is received - so no acknowledgement
@@ -1897,24 +1928,83 @@ void MeshtasticChatView::send_text(const std::string& text, uint32_t dest) {
     // unicast like a Meshtastic one: its recipient owes us an ACK.
     m.expects_ack = (unicast || (meshcore && channel_idx_ == MC_DM)) && (radio_mode_ != 1);
     m.channel = channel_idx_;
-    messages_.push_back(m);
-    console_.set_message_index(messages_.size() - 1);
-    if (messages_.size() > MAX_MESSAGES)
-        messages_.erase(messages_.begin());
-    console_.write_tagged(text + stamp_after() + "\n", m.status, pid);
-    // Saved exactly as shown: the delivery dot carries "this one is
-    // mine", so the old "me:" prefix was noise the live view never had.
-    messages_.back().hist_offset = save_line(text + stamp_after() + "\n", m.status);
     // Which conversation this line lives in, so its delivery byte can be
     // patched later even if the reader has walked off to another chat.
-    messages_.back().hist_peer = conv_peer();
-    messages_.back().hist_ch = conv_channel();
+    m.hist_peer = conv_peer();
+    m.hist_ch = conv_channel();
+    const uint8_t status = m.status;
+    const bool kept = keep_message(std::move(m));
+    if (kept) console_.set_message_index(messages_.size() - 1);
+    console_.write_tagged(text + stamp_after() + "\n", status, pid);
+    // Saved exactly as shown: the delivery dot carries "this one is
+    // mine", so the old "me:" prefix was noise the live view never had.
+    const uint32_t saved_at = save_line(text + stamp_after() + "\n", status);
+    if (kept) messages_.back().hist_offset = saved_at;
     text_count_.set("m:" + to_string_dec_uint(++total_msgs_));
     set_pkt_indicator(true);
     // Hand the built packet up to the owning view to actually key
     // the radio.  Without this the message was only echoed to the
     // chat and never transmitted (RF-silent compose+send).
     if (!meshcore && on_tx_request_) on_tx_request_(buf, len);
+}
+
+// The message list, and the only place it grows.
+//
+// It used to be a plain push_back, and in send_text the oldest entry was dropped
+// AFTER the new one went in. A vector that is full doubles to make room: the 17th
+// message asked for 32 entries in one piece, 3.6 kB, on a heap with a kilobyte or two
+// left - operator new stops the firmware on "Out of Memory", and the serial shell
+// goes with it. Messages that arrive were dropped-then-added and never tripped it,
+// which is why only a sitting of typed messages did. The doubling on the way up
+// (1, 2, 4, 8, 16 entries, each a fresh block) was also what `sysinfo` showed as
+// memory "lost" per message.
+//
+// So: one block, taken whole the first time a message needs it and never grown;
+// fewer entries when the heap cannot spare sixteen and still open the keyboard, none
+// when it cannot spare two. The oldest entry always goes before the new one comes.
+bool MeshtasticChatView::keep_message(ChatMessage&& m) {
+    if (!messages_.capacity()) {
+        for (size_t n = list_cap_; n >= 2; n /= 2) {
+            if (!heap_has(n * sizeof(ChatMessage), SEND_ROOM)) continue;
+            messages_.reserve(n);
+            break;
+        }
+    }
+    if (!messages_.capacity()) return false;
+    // Short strings live inside the entry; longer ones are heap blocks of their own.
+    auto held = [](const ChatMessage& x) { return x.text.size() + x.from_name.size(); };
+    size_t bytes = held(m);
+    for (const auto& x : messages_) bytes += held(x);
+    while (!messages_.empty() &&
+           (messages_.size() >= messages_.capacity() || bytes > MAX_MESSAGE_BYTES)) {
+        bytes -= held(messages_.front());
+        drop_oldest_message();
+    }
+    messages_.push_back(std::move(m));
+    return true;
+}
+
+void MeshtasticChatView::drop_oldest_message() {
+    messages_.erase(messages_.begin());
+    console_.messages_dropped(false);
+}
+
+void MeshtasticChatView::shed_messages() {
+    std::vector<ChatMessage>().swap(messages_);  // clear() would keep the block
+    console_.messages_dropped(true);
+    // The next message would claim the same sixteen entries again and put the heap
+    // back where it was. A short list from here on, until the app is reopened.
+    list_cap_ = MAX_MESSAGES_TIGHT;
+}
+
+// The cards are a convenience and the chat is not: when memory is short they are what
+// goes. A message still waiting for its receipt loses its dot's update with them.
+bool MeshtasticChatView::make_room(size_t bytes) {
+    if (heap_has(bytes)) return true;
+    if (!messages_.capacity()) return false;
+    shed_messages();
+    console_.write_tech("* low memory: message cards dropped\n");
+    return heap_has(bytes);
 }
 
 void MeshtasticChatView::set_filter(uint8_t mode) {
@@ -2107,25 +2197,25 @@ void MeshtasticChatView::set_mc_dm(uint32_t key4, const std::string& name) {
 // (MC_DM). A group text names its sender only by the name in front of the text.
 void MeshtasticChatView::show_meshcore_text(uint8_t channel, uint32_t peer, const std::string& from, const std::string& text_in, int8_t rssi, uint8_t hops) {
     const bool dm = (channel == MC_DM);
+    make_room(MESSAGE_ROOM);
     std::string text = text_in;
     while (!text.empty() && static_cast<uint8_t>(text.back()) < 0x20) text.pop_back();
     ChatMessage m;
     m.from_name = from;
     m.text = text;
-    m.timestamp = to_string_datetime(rtc_time::now(), HM);
+    stamp_message(m);
     m.to_id = BROADCAST_ADDR;
     m.from_id = BROADCAST_ADDR;  // "Reply" stays on this conversation (0 would aim a Meshtastic DM at node 0)
     m.rssi = rssi;
     m.hops = hops;
     m.channel = channel;
     m.sent_tick = now_ticks_;
-    if (messages_.size() >= MAX_MESSAGES) messages_.erase(messages_.begin());
-    messages_.push_back(m);
+    const bool kept = keep_message(std::move(m));
     const std::string who = (display_.name_mode == 3) ? std::string() : from;
     const std::string line = stamp() + who + (who.empty() ? "" : ": ") + text;
     bool rang = false;
     if (dest_id_ == BROADCAST_ADDR && channel_idx_ == channel && (!dm || mc_peer_ == peer)) {
-        console_.set_message_index(messages_.size() - 1);
+        if (kept) console_.set_message_index(messages_.size() - 1);
         console_.take_unicode_flag();
         console_.take_bell_flag();
         console_.write(line + "\n");
@@ -2597,12 +2687,13 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
     // Chat shows TEXT only. NODEINFO/POSITION/TELEMETRY/ROUTING already update the
     // Nodes + Data tabs via the router dispatch, so keep them out of the chat.
     if (pkt.data.portnum != PortNum::TEXT_MESSAGE) return;
+    make_room(MESSAGE_ROOM);
 
     ChatMessage m;
     m.from_name = from_name;
     m.from_id = pkt.header.from;
     m.text = pkt.text_payload();
-    m.timestamp = to_string_datetime(rtc_time::now(), HM);
+    stamp_message(m);
     m.outgoing = false;
 
     // Trim trailing CONTROL bytes only (an occasional symbol error mis-reads the
@@ -2634,9 +2725,6 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
         const uint8_t hs = pkt.header.hop_start(), hl = pkt.header.hop_limit();
         m.hops = (hs >= hl) ? static_cast<uint8_t>(hs - hl) : 0;
     }
-    if (messages_.size() >= MAX_MESSAGES) messages_.erase(messages_.begin());
-    messages_.push_back(m);
-
     // A text addressed to us alone is a direct message: open/keep its thread and tag
     // the line so it is not mistaken for channel traffic.
     const bool direct = (pkt.header.to == router_.local_node_id());
@@ -2656,6 +2744,7 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
     // A node the user gave a colour gets a square at the left edge, like the delivery
     // dots on our own messages.
     const uint8_t colour = (ne && ne->colour) ? static_cast<uint8_t>(8 + ne->colour) : 0;
+    const bool kept = keep_message(std::move(m));  // m is not read below this line
 
     // Each conversation keeps its own history. A message belongs to the thread with its
     // sender when it was addressed to us alone, otherwise to the channel it arrived on.
@@ -2665,7 +2754,7 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
     const bool here = direct ? (dest_id_ == pkt.header.from)
                              : (dest_id_ == BROADCAST_ADDR && pkt.channel_index == channel_idx_);
     if (here) {
-        console_.set_message_index(messages_.size() - 1);  // tap this line for details
+        if (kept) console_.set_message_index(messages_.size() - 1);  // tap this line for details
         // Start clean: these flags are raised by anything the console renders, and
         // replaying the saved history at startup raises them too. Left over, they made
         // the first real message of a session claim a bell and unprintable characters
@@ -2724,13 +2813,17 @@ void MeshtasticChatView::on_packet(const MeshPacket& pkt) {
 
 void MeshtasticChatView::on_ack(uint32_t request_id, bool is_ack) {
     for (auto& m : messages_) {
-        if (m.outgoing && m.status == 1 && m.packet_id == request_id) {
+        if (!m.outgoing || m.packet_id != request_id) continue;
+        if (m.status == 1) {
             m.status = is_ack ? 2 : 3;  // delivered (green) / failed (red)
             console_.set_marker(request_id, m.status);
             patch_saved_marker(m, m.status);
-            return;
         }
+        return;
     }
+    // Its entry is gone - pushed out by newer messages, or given up for memory - but
+    // the line may still be on screen, and it can still show what became of it.
+    console_.set_marker(request_id, is_ack ? 2 : 3);
 }
 
 // Attempts ran out without an acknowledgement. A unicast that nobody answered has
@@ -3236,7 +3329,7 @@ void MeshtasticMessageView::paint(Painter& painter) {
     row("To", msg_.to_id == meshtastic::BROADCAST_ADDR
                   ? std::string("everyone")
                   : "!" + to_string_hex(msg_.to_id, 8));
-    row("Time", msg_.timestamp);
+    row("Time", to_string_dec_uint(msg_.hh, 2, '0') + ":" + to_string_dec_uint(msg_.mm, 2, '0'));
     row("Status", STATUS[msg_.status < 4 ? msg_.status : 0]);
     if (msg_.packet_id) row("Packet", to_string_hex(msg_.packet_id, 8));
     row("Length", to_string_dec_uint(static_cast<uint32_t>(msg_.text.size())) + " chars");
