@@ -65,8 +65,10 @@ struct ChatMessage {
     uint32_t from_id{0};
     uint32_t to_id{0};  // who it was addressed to (broadcast for channel text)
     std::string text;
-    std::string timestamp;
     bool outgoing{false};
+    // When it was sent or heard, for the message card. Two bytes, not a string: the chat
+    // holds a list of these in one block, and a std::string is 24 bytes to carry "20:15".
+    uint8_t hh{0}, mm{0};
     uint32_t packet_id{0};  // our TX id, for ACK matching (0 = n/a)
     // 0=none, 1=pending, 2=delivered, 3=failed (a unicast nobody acknowledged),
     // 4=sent but never confirmed - which is all a broadcast can ever tell us.
@@ -830,6 +832,13 @@ class MeshConsole : public Widget {
     size_t message_at(Coord y) const;
     // Tag the lines written next with a chat-message index, so they can be tapped.
     void set_message_index(size_t idx) { pending_msg_ = static_cast<uint32_t>(idx) + 1; }
+    // The chat dropped its oldest message (all = every one): the links move down with
+    // the list, and a line whose message is gone has none. They used to be left as they
+    // were, each pointing one entry too far once the list was full.
+    void messages_dropped(bool all) {
+        for (auto& l : lines_)
+            if (l.msg) l.msg = all ? 0 : l.msg - 1;
+    }
     void clear(bool clear_buffer);
     void paint(Painter& painter) override;
     // Scrollback: the console keeps a larger history than fits on screen; when it
@@ -1133,8 +1142,36 @@ class MeshtasticChatView : public View {
     meshtastic::MeshRouter& router_;
     meshtastic::NodeDB& node_db_;
 
+    // The last few messages, for the card a tap on a line opens, for the delivery dot
+    // and for spotting a repeat. Filled only through keep_message().
     std::vector<ChatMessage> messages_{};
     static constexpr size_t MAX_MESSAGES = 16;
+    // ...and how many once the list has been given up for memory in this session:
+    // enough for the delivery dots of what was just sent, without taking the room
+    // straight back.
+    static constexpr size_t MAX_MESSAGES_TIGHT = 4;
+    uint8_t list_cap_{MAX_MESSAGES};
+    // Text (and long sender names) the list may hold on top of its own block. A full
+    // list of 160-character MeshCore messages would otherwise be 2.5 kB of copies of
+    // what the console already shows.
+    static constexpr size_t MAX_MESSAGE_BYTES = 768;
+    // What a message needs from the heap while it is typed, built, shown and saved:
+    // the entry view, a File with its sector buffer, a few strings. Asked for in one
+    // piece before the keyboard opens, so "no room" is said in the chat instead of on
+    // the red screen.
+    static constexpr size_t SEND_ROOM = 1024;
+    // The same for showing and saving one message. A message that arrives cannot be
+    // asked to wait, so the list above is given up when this much is not free.
+    static constexpr size_t MESSAGE_ROOM = 640;
+    // Add to messages_, the oldest giving way. False when it was not kept (no memory):
+    // the line is still shown, it just has no card.
+    bool keep_message(ChatMessage&& m);
+    void drop_oldest_message();
+    // Hand the whole list back to the allocator.
+    void shed_messages();
+    // True when `bytes` can be had in one piece - after giving up the list, if it
+    // takes that.
+    bool make_room(size_t bytes);
     uint32_t total_msgs_{0};  // running count of all messages (sent + received)
     std::string compose_str_{};
 
