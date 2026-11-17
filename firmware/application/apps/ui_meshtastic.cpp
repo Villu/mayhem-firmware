@@ -1860,13 +1860,19 @@ void MeshtasticChatView::focus() {
     button_send_.focus();
 }
 
+// A tap on a message's line opens its card.
+//
+// The press has to be claimed for the release to arrive at all: the dispatcher sends
+// the rest of a touch only to the widget that answered its Start. This used to return
+// false for everything but End, so it never saw one, and no card ever opened. Only a
+// line that has a message claims the press; the rest of the chat stays inert.
 bool MeshtasticChatView::on_touch(const TouchEvent event) {
-    if (event.type != TouchEvent::Type::End) return false;
     const auto r = screen_rect();
     const Coord y = event.point.y();
     if (y < r.top() + CON_Y || y >= r.top() + CON_Y + CON_H) return false;
     const size_t idx = console_.message_at(y);  // message_at subtracts its own top
     if (idx >= messages_.size()) return false;
+    if (event.type != TouchEvent::Type::End) return true;
     if (!heap_has(sizeof(MeshtasticMessageView), 256)) {
         write_console("* low memory: no room for the message card\n");
         return true;
@@ -3294,13 +3300,15 @@ MeshtasticMessageView::MeshtasticMessageView(NavigationView& nav, const ChatMess
     // which opens the keyboard already addressed to the sender.
     button_resend_.set_text(msg_.outgoing ? "Resend" : "Reply");
     button_resend_.on_select = [this](Button&) {
-        if (on_resend_) {
-            if (msg_.outgoing)
-                on_resend_(msg_.text, msg_.to_id);
-            else
-                on_resend_(std::string(), msg_.from_id);
-        }
-        nav_.pop();
+        // Close first, act after. A reply opens the keyboard, and popping after that
+        // would close the keyboard just opened and leave this card standing. The
+        // pop destroys this view, so everything needed is taken out of it beforehand.
+        auto resend = std::move(on_resend_);
+        std::string text = msg_.outgoing ? msg_.text : std::string();
+        const uint32_t to = msg_.outgoing ? msg_.to_id : msg_.from_id;
+        NavigationView& nav = nav_;
+        nav.pop();
+        if (resend) resend(std::move(text), to);
     };
 }
 
@@ -3322,7 +3330,7 @@ void MeshtasticMessageView::paint(Painter& painter) {
         painter.draw_string({x0 + 9 * 8, y}, fg, val.substr(0, 21));
         y += 18;
     };
-    static const char* STATUS[4] = {"-", "pending", "delivered", "no ack"};
+    static const char* STATUS[5] = {"-", "pending", "delivered", "no ack", "sent"};
 
     row("From", msg_.outgoing ? std::string("me") : msg_.from_name);
     if (!msg_.outgoing) row("Node", "!" + to_string_hex(msg_.from_id, 8));
@@ -3330,7 +3338,7 @@ void MeshtasticMessageView::paint(Painter& painter) {
                   ? std::string("everyone")
                   : "!" + to_string_hex(msg_.to_id, 8));
     row("Time", to_string_dec_uint(msg_.hh, 2, '0') + ":" + to_string_dec_uint(msg_.mm, 2, '0'));
-    row("Status", STATUS[msg_.status < 4 ? msg_.status : 0]);
+    row("Status", STATUS[msg_.status < 5 ? msg_.status : 0]);
     if (msg_.packet_id) row("Packet", to_string_hex(msg_.packet_id, 8));
     row("Length", to_string_dec_uint(static_cast<uint32_t>(msg_.text.size())) + " chars");
     if (!msg_.outgoing) {
